@@ -1,0 +1,8 @@
+FROM python:3.11-slim
+
+WORKDIR /runner
+COPY services/runner/requirements.txt /runner/requirements.txt
+RUN pip install --no-cache-dir -r /runner/requirements.txt
+
+COPY services/runner/app /runner/app
+CMD ["python", "-u", "app/runner.py"]

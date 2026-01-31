@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  runner:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.runner
+    depends_on:
+      - api
+    restart: unless-stopped
