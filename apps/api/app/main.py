@@ -13,6 +13,7 @@ app = FastAPI(title="m87-governed-swarm-api", version="0.1.2")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 API_KEY = os.getenv("M87_API_KEY", "m87-dev-key-change-me")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+ENABLE_TEST_ENDPOINTS = os.getenv("M87_ENABLE_TEST_ENDPOINTS", "false").lower() == "true"
 
 # CORS - tightened for V1.2
 app.add_middleware(
@@ -382,7 +383,11 @@ def admin_emit(payload: Dict[str, Any], x_m87_key: Optional[str] = Header(None, 
     """
     Admin endpoint to emit arbitrary events (for testing).
     Used by proof test to verify runner ignores events stream.
+    Disabled by default - set M87_ENABLE_TEST_ENDPOINTS=true to enable.
     """
+    if not ENABLE_TEST_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Not found")
+
     verify_api_key(x_m87_key)
 
     event_type = payload.get("type")

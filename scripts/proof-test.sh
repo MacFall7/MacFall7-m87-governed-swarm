@@ -1,6 +1,14 @@
 #!/bin/bash
 # M87 V1.2 Proof Test - Validates the four invariants
-# Run this after: ./scripts/boot.sh fresh
+#
+# Usage:
+#   ./scripts/proof-test.sh
+#
+# For full test including Invariant 3b (runner isolation):
+#   1. Set M87_ENABLE_TEST_ENDPOINTS=true in .env
+#   2. Restart: docker compose -f infra/docker-compose.yml up -d --build
+#   3. Run: ./scripts/proof-test.sh
+#   4. Set M87_ENABLE_TEST_ENDPOINTS=false and restart for production
 
 set -euo pipefail
 
@@ -151,28 +159,41 @@ echo "========================================"
 echo ""
 
 echo "Emitting fake 'proposal.allowed' event (V1.1 would have triggered runner)..."
-curl -s -X POST "$API/v1/admin/emit" \
+EMIT_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API/v1/admin/emit" \
   -H "content-type: application/json" \
   -H "X-M87-Key: $M87_API_KEY" \
-  -d '{"type":"proposal.allowed","payload":{"proposal_id":"FAKE-EVENT-SHOULD-NOT-RUN","decision":"ALLOW","reasons":["fake"]}}' | jq .
-echo ""
+  -d '{"type":"proposal.allowed","payload":{"proposal_id":"FAKE-EVENT-SHOULD-NOT-RUN","decision":"ALLOW","reasons":["fake"]}}')
+EMIT_CODE=$(echo "$EMIT_RESPONSE" | tail -1)
+EMIT_BODY=$(echo "$EMIT_RESPONSE" | head -n -1)
 
-echo "Waiting 5s for runner to potentially react..."
-sleep 5
-
-echo "Checking if runner created a job for fake event..."
-JOBS=$(curl -s "$API/v1/jobs")
-JOBS_FAKE=$(echo "$JOBS" | jq '[.jobs[] | select(.proposal_id=="FAKE-EVENT-SHOULD-NOT-RUN")] | length')
-if [ "$JOBS_FAKE" -eq 0 ]; then
-    echo -e "${GREEN}✓ Runner ignored events stream (correct)${NC}"
+if [ "$EMIT_CODE" = "404" ]; then
+    echo -e "${YELLOW}⚠ Test endpoints disabled (M87_ENABLE_TEST_ENDPOINTS=false)${NC}"
+    echo "  To run this test, restart with: M87_ENABLE_TEST_ENDPOINTS=true"
+    echo "  Or add to .env: M87_ENABLE_TEST_ENDPOINTS=true"
+    echo ""
+    echo -e "${YELLOW}INVARIANT 3b SKIPPED (endpoints disabled - this is correct for prod)${NC}"
+    echo ""
 else
-    echo -e "${RED}✗ Runner reacted to events stream (BAD - V1.1 regression!)${NC}"
-    exit 1
-fi
-echo ""
+    echo "$EMIT_BODY" | jq .
+    echo ""
 
-echo -e "${GREEN}INVARIANT 3b PASSED${NC}"
-echo ""
+    echo "Waiting 5s for runner to potentially react..."
+    sleep 5
+
+    echo "Checking if runner created a job for fake event..."
+    JOBS=$(curl -s "$API/v1/jobs")
+    JOBS_FAKE=$(echo "$JOBS" | jq '[.jobs[] | select(.proposal_id=="FAKE-EVENT-SHOULD-NOT-RUN")] | length')
+    if [ "$JOBS_FAKE" -eq 0 ]; then
+        echo -e "${GREEN}✓ Runner ignored events stream (correct)${NC}"
+    else
+        echo -e "${RED}✗ Runner reacted to events stream (BAD - V1.1 regression!)${NC}"
+        exit 1
+    fi
+    echo ""
+
+    echo -e "${GREEN}INVARIANT 3b PASSED${NC}"
+    echo ""
+fi
 
 # ========================================
 # INVARIANT 3: Approval with key → job minted

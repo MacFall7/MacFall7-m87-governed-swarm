@@ -31,6 +31,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      - M87_ENABLE_TEST_ENDPOINTS=${M87_ENABLE_TEST_ENDPOINTS:-false}
     depends_on:
       redis:
         condition: service_healthy
