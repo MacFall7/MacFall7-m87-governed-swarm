@@ -47,6 +47,10 @@
       animation: pulse 2s infinite;
     }
 
+    .pulse.disconnected {
+      background: #ff4444;
+    }
+
     @keyframes pulse {
       0%, 100% { opacity: 1; }
       50% { opacity: 0.4; }
@@ -69,9 +73,9 @@
 
     .tab {
       flex: 1;
-      padding: 12px;
+      padding: 12px 8px;
       text-align: center;
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 500;
       color: #666;
       cursor: pointer;
@@ -87,10 +91,14 @@
     .tab .badge {
       background: #ff4444;
       color: white;
-      font-size: 11px;
-      padding: 2px 6px;
-      border-radius: 10px;
-      margin-left: 6px;
+      font-size: 10px;
+      padding: 2px 5px;
+      border-radius: 8px;
+      margin-left: 4px;
+    }
+
+    .tab .badge.jobs {
+      background: #4488ff;
     }
 
     .panel {
@@ -118,7 +126,7 @@
     }
 
     .event-type {
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 600;
       padding: 4px 8px;
       border-radius: 6px;
@@ -129,7 +137,11 @@
     .event-type.denied { background: #3d0a0a; color: #ff4444; }
     .event-type.needs_approval { background: #3d3d0a; color: #ffcc00; }
     .event-type.approved { background: #0a3d0a; color: #00ff88; }
-    .event-type.result { background: #0a0a3d; color: #4488ff; }
+    .event-type.completed { background: #0a3d0a; color: #00ff88; }
+    .event-type.failed { background: #3d0a0a; color: #ff4444; }
+    .event-type.pending { background: #3d3d0a; color: #ffcc00; }
+    .event-type.running { background: #0a0a3d; color: #4488ff; }
+    .event-type.created { background: #1a1a2a; color: #8888ff; }
     .event-type.intent { background: #1a1a1a; color: #888; }
 
     .time {
@@ -137,10 +149,10 @@
       color: #555;
     }
 
-    .proposal-id {
+    .id-line {
       font-family: 'SF Mono', Monaco, monospace;
-      font-size: 13px;
-      color: #888;
+      font-size: 12px;
+      color: #666;
       margin-bottom: 8px;
     }
 
@@ -157,20 +169,26 @@
       border-left: 2px solid #333;
     }
 
-    .effects {
+    .effects, .tags {
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
       margin-top: 12px;
     }
 
-    .effect {
-      font-size: 11px;
+    .effect, .tag {
+      font-size: 10px;
       padding: 3px 8px;
       background: #1a1a1a;
       border: 1px solid #333;
       border-radius: 4px;
       font-family: monospace;
+    }
+
+    .tag.tool {
+      background: #1a1a2a;
+      border-color: #4488ff;
+      color: #4488ff;
     }
 
     .actions {
@@ -218,18 +236,18 @@
 
     .output {
       font-family: 'SF Mono', Monaco, monospace;
-      font-size: 12px;
+      font-size: 11px;
       background: #0a0a0a;
       padding: 12px;
       border-radius: 8px;
       margin-top: 8px;
       white-space: pre-wrap;
       word-break: break-all;
-      max-height: 100px;
+      max-height: 80px;
       overflow-y: auto;
+      color: #888;
     }
 
-    /* Bottom nav for mobile */
     .bottom-nav {
       position: fixed;
       bottom: 0;
@@ -250,11 +268,42 @@
       padding: 10px 20px;
       font-size: 13px;
     }
+
+    /* Settings panel */
+    .settings-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .settings-row label {
+      font-size: 13px;
+      color: #888;
+      min-width: 80px;
+    }
+
+    .settings-row input {
+      flex: 1;
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: #e0e0e0;
+      font-size: 13px;
+      font-family: monospace;
+    }
+
+    .save-btn {
+      background: #00ff88;
+      color: #000;
+      padding: 10px 20px;
+    }
   </style>
 </head>
 <body>
   <header>
-    <h1><span class="pulse"></span> M87 Governed Swarm</h1>
+    <h1><span class="pulse" id="pulse"></span> M87 Governed Swarm</h1>
     <div class="status" id="status">Connecting...</div>
   </header>
 
@@ -262,7 +311,11 @@
     <div class="tab active" data-panel="approvals">
       Approvals <span class="badge" id="approval-count" style="display:none">0</span>
     </div>
+    <div class="tab" data-panel="jobs">
+      Jobs <span class="badge jobs" id="job-count" style="display:none">0</span>
+    </div>
     <div class="tab" data-panel="timeline">Timeline</div>
+    <div class="tab" data-panel="settings">⚙️</div>
   </div>
 
   <div class="panel active" id="approvals">
@@ -273,8 +326,31 @@
     <div id="approvals-list"></div>
   </div>
 
+  <div class="panel" id="jobs">
+    <div class="empty" id="jobs-empty" style="display:none">
+      <div class="empty-icon">📋</div>
+      <div>No jobs yet</div>
+    </div>
+    <div id="jobs-list"></div>
+  </div>
+
   <div class="panel" id="timeline">
     <div id="timeline-list"></div>
+  </div>
+
+  <div class="panel" id="settings">
+    <div class="card">
+      <h3 style="margin-bottom: 16px; font-size: 16px;">Configuration</h3>
+      <div class="settings-row">
+        <label>API Key</label>
+        <input type="password" id="api-key-input" placeholder="Enter API key">
+      </div>
+      <div class="settings-row">
+        <label>API URL</label>
+        <input type="text" id="api-url-input" placeholder="http://localhost:8000">
+      </div>
+      <button class="save-btn" onclick="saveSettings()">Save</button>
+    </div>
   </div>
 
   <div class="bottom-nav">
@@ -282,11 +358,33 @@
   </div>
 
   <script>
-    const API = window.location.hostname === 'localhost'
-      ? 'http://localhost:8000'
-      : `${window.location.protocol}//${window.location.hostname}:8000`;
+    // Config with localStorage persistence
+    let API_KEY = localStorage.getItem('m87_api_key') || 'm87-dev-key-change-me';
+    let API = localStorage.getItem('m87_api_url') || (
+      window.location.hostname === 'localhost'
+        ? 'http://localhost:8000'
+        : `${window.location.protocol}//${window.location.hostname}:8000`
+    );
 
-    let lastEventId = null;
+    // Initialize settings inputs
+    document.getElementById('api-key-input').value = API_KEY;
+    document.getElementById('api-url-input').value = API;
+
+    function saveSettings() {
+      API_KEY = document.getElementById('api-key-input').value;
+      API = document.getElementById('api-url-input').value;
+      localStorage.setItem('m87_api_key', API_KEY);
+      localStorage.setItem('m87_api_url', API);
+      refresh();
+      alert('Settings saved');
+    }
+
+    function headers() {
+      return {
+        'Content-Type': 'application/json',
+        'X-M87-Key': API_KEY,
+      };
+    }
 
     // Tab switching
     document.querySelectorAll('.tab').forEach(tab => {
@@ -310,7 +408,9 @@
       if (type.includes('denied')) return 'denied';
       if (type.includes('needs_approval')) return 'needs_approval';
       if (type.includes('approved')) return 'approved';
-      if (type.includes('result')) return 'result';
+      if (type.includes('completed')) return 'completed';
+      if (type.includes('failed')) return 'failed';
+      if (type.includes('created')) return 'created';
       return 'intent';
     }
 
@@ -322,7 +422,9 @@
             <span class="event-type needs_approval">Needs Approval</span>
             <span class="time">${formatTime(item.id)}</span>
           </div>
-          <div class="proposal-id">${item.proposal_id}</div>
+          <div class="id-line">Proposal: ${item.proposal_id}</div>
+          ${payload.summary ? `<div class="summary">${payload.summary}</div>` : ''}
+          ${payload.agent ? `<div class="id-line">Agent: ${payload.agent}</div>` : ''}
           <div class="reasons">${(payload.reasons || []).join('<br>')}</div>
           ${payload.allowed_effects ? `
             <div class="effects">
@@ -337,20 +439,46 @@
       `;
     }
 
+    function renderJob(job) {
+      const statusClass = job.status || 'pending';
+      return `
+        <div class="card">
+          <div class="card-header">
+            <span class="event-type ${statusClass}">${job.status || 'pending'}</span>
+            <span class="time">${formatTime(job.stream_id)}</span>
+          </div>
+          <div class="id-line">Job: ${job.job_id}</div>
+          <div class="id-line">Proposal: ${job.proposal_id}</div>
+          <div class="tags">
+            <span class="tag tool">${job.tool}</span>
+            <span class="tag">timeout: ${job.timeout_seconds}s</span>
+          </div>
+          ${job.output ? `<div class="output">${job.output}</div>` : ''}
+          ${job.error ? `<div class="output" style="color: #ff4444">${job.error}</div>` : ''}
+        </div>
+      `;
+    }
+
     function renderEvent(event) {
       const type = event.type || 'unknown';
       const payload = event.payload || {};
       const cls = getEventClass(type);
 
       let content = '';
+      if (payload.job_id) {
+        content += `<div class="id-line">Job: ${payload.job_id}</div>`;
+      }
       if (payload.proposal_id) {
-        content += `<div class="proposal-id">${payload.proposal_id}</div>`;
+        content += `<div class="id-line">Proposal: ${payload.proposal_id}</div>`;
       }
       if (payload.reasons) {
         content += `<div class="reasons">${payload.reasons.join('<br>')}</div>`;
       }
       if (payload.goal) {
         content += `<div class="summary">${payload.goal}</div>`;
+      }
+      if (payload.tool) {
+        content += `<div class="tags"><span class="tag tool">${payload.tool}</span></div>`;
       }
       if (payload.output) {
         content += `<div class="output">${payload.output}</div>`;
@@ -362,7 +490,7 @@
       return `
         <div class="card">
           <div class="card-header">
-            <span class="event-type ${cls}">${type.replace('proposal.', '').replace('runner.', '').replace('intent.', '')}</span>
+            <span class="event-type ${cls}">${type.replace('proposal.', '').replace('job.', '').replace('intent.', '')}</span>
             <span class="time">${formatTime(event.id)}</span>
           </div>
           ${content}
@@ -395,6 +523,37 @@
       }
     }
 
+    async function loadJobs() {
+      try {
+        const res = await fetch(`${API}/v1/jobs?limit=50`);
+        const data = await res.json();
+        const jobs = data.jobs || [];
+
+        const countEl = document.getElementById('job-count');
+        const emptyEl = document.getElementById('jobs-empty');
+        const listEl = document.getElementById('jobs-list');
+
+        const pendingCount = jobs.filter(j => j.status === 'pending' || j.status === 'running').length;
+
+        if (jobs.length > 0) {
+          if (pendingCount > 0) {
+            countEl.textContent = pendingCount;
+            countEl.style.display = 'inline';
+          } else {
+            countEl.style.display = 'none';
+          }
+          emptyEl.style.display = 'none';
+          listEl.innerHTML = jobs.reverse().map(renderJob).join('');
+        } else {
+          countEl.style.display = 'none';
+          emptyEl.style.display = 'block';
+          listEl.innerHTML = '';
+        }
+      } catch (e) {
+        console.error('Failed to load jobs:', e);
+      }
+    }
+
     async function loadTimeline() {
       try {
         const res = await fetch(`${API}/v1/events?limit=50`);
@@ -403,10 +562,6 @@
 
         document.getElementById('timeline-list').innerHTML =
           events.reverse().map(renderEvent).join('') || '<div class="empty">No events yet</div>';
-
-        if (events.length > 0) {
-          lastEventId = events[0].id;
-        }
       } catch (e) {
         console.error('Failed to load timeline:', e);
       }
@@ -414,7 +569,14 @@
 
     async function approveProposal(proposalId) {
       try {
-        await fetch(`${API}/v1/approve/${proposalId}`, { method: 'POST' });
+        const res = await fetch(`${API}/v1/approve/${proposalId}`, {
+          method: 'POST',
+          headers: headers(),
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.detail || 'Failed');
+        }
         document.getElementById(`approval-${proposalId}`)?.remove();
         refresh();
       } catch (e) {
@@ -424,7 +586,14 @@
 
     async function denyProposal(proposalId) {
       try {
-        await fetch(`${API}/v1/deny/${proposalId}`, { method: 'POST' });
+        const res = await fetch(`${API}/v1/deny/${proposalId}`, {
+          method: 'POST',
+          headers: headers(),
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.detail || 'Failed');
+        }
         document.getElementById(`approval-${proposalId}`)?.remove();
         refresh();
       } catch (e) {
@@ -437,14 +606,16 @@
         const res = await fetch(`${API}/health`);
         const data = await res.json();
         document.getElementById('status').textContent =
-          data.ok ? `Connected • Redis ${data.redis}` : 'Disconnected';
+          data.ok ? `Connected • V${data.version || '?'} • Redis ${data.redis}` : 'Disconnected';
+        document.getElementById('pulse').classList.toggle('disconnected', !data.ok);
       } catch (e) {
         document.getElementById('status').textContent = 'Disconnected';
+        document.getElementById('pulse').classList.add('disconnected');
       }
     }
 
     async function refresh() {
-      await Promise.all([loadPendingApprovals(), loadTimeline(), checkHealth()]);
+      await Promise.all([loadPendingApprovals(), loadJobs(), loadTimeline(), checkHealth()]);
     }
 
     // Initial load

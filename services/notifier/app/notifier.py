@@ -1,11 +1,12 @@
 """
-M87 Notifier Service
+M87 Notifier Service - V1.2
 
 Watches the event stream and sends notifications for:
 - proposal.needs_approval  → "You're needed"
-- runner.result            → "Job complete/failed"
+- job.completed            → "Job done"
+- job.failed               → "Job failed"
 
-V1: Console output + webhook placeholder
+V1.2: Console output + webhook placeholder.
 Swap transport later (push/SMS/Telegram) without changing system.
 """
 
@@ -20,54 +21,85 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 API_BASE = os.getenv("API_BASE", "http://api:8000")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # Optional: external webhook
 
-STREAM_KEY = "m87:events"
+EVENT_STREAM = "m87:events"
 CONSUMER_GROUP = "notifier"
 CONSUMER_NAME = "notifier-1"
 
-# Events that trigger notifications
+# Events that trigger notifications - V1.2: cleaner signals
 NOTIFY_EVENTS = {
-    "proposal.needs_approval": "🔔 APPROVAL NEEDED",
-    "runner.result": "✅ JOB COMPLETE",
-    "proposal.denied": "❌ PROPOSAL DENIED",
+    "proposal.needs_approval": ("🔔", "APPROVAL NEEDED", "high"),
+    "job.completed": ("✅", "JOB COMPLETE", "normal"),
+    "job.failed": ("❌", "JOB FAILED", "high"),
+    "proposal.denied": ("🚫", "PROPOSAL DENIED", "normal"),
 }
 
 
 def setup_consumer_group(rdb: Redis) -> None:
     """Create consumer group if it doesn't exist."""
     try:
-        rdb.xgroup_create(STREAM_KEY, CONSUMER_GROUP, id="0", mkstream=True)
+        rdb.xgroup_create(EVENT_STREAM, CONSUMER_GROUP, id="0", mkstream=True)
+        print(f"✓ Created consumer group: {CONSUMER_GROUP}", flush=True)
     except Exception as e:
         if "BUSYGROUP" not in str(e):
             raise
+        print(f"✓ Consumer group exists: {CONSUMER_GROUP}", flush=True)
 
 
 def send_notification(event_type: str, payload: dict) -> None:
     """Send notification via configured transport."""
-    title = NOTIFY_EVENTS.get(event_type, event_type)
+    if event_type not in NOTIFY_EVENTS:
+        return
+
+    emoji, title, priority = NOTIFY_EVENTS[event_type]
     timestamp = datetime.now().strftime("%H:%M:%S")
 
-    proposal_id = payload.get("proposal_id", "unknown")
+    # Extract relevant IDs
+    proposal_id = payload.get("proposal_id", "")
+    job_id = payload.get("job_id", "")
+    short_id = (job_id or proposal_id)[:8] if (job_id or proposal_id) else "unknown"
 
     # Build message based on event type
     if event_type == "proposal.needs_approval":
         reasons = payload.get("reasons", [])
-        message = f"Proposal {proposal_id[:8]}... needs your approval.\nReasons: {', '.join(reasons)}"
-    elif event_type == "runner.result":
-        status = payload.get("status", "unknown")
+        summary = payload.get("summary", "")
+        agent = payload.get("agent", "unknown")
+        message = f"Proposal {short_id}... from {agent} needs your approval."
+        if summary:
+            message += f"\n→ {summary}"
+        if reasons:
+            message += f"\nReasons: {', '.join(reasons)}"
+
+    elif event_type == "job.completed":
         tool = payload.get("tool", "unknown")
-        output = payload.get("output", "")[:100]
-        message = f"Job for {proposal_id[:8]}... {status}.\nTool: {tool}\nOutput: {output}"
+        output = (payload.get("output") or "")[:80]
+        message = f"Job {short_id}... completed."
+        message += f"\nTool: {tool}"
+        if output:
+            message += f"\nOutput: {output}"
+
+    elif event_type == "job.failed":
+        tool = payload.get("tool", "unknown")
+        error = (payload.get("output") or payload.get("error") or "")[:80]
+        message = f"Job {short_id}... FAILED."
+        message += f"\nTool: {tool}"
+        if error:
+            message += f"\nError: {error}"
+
     elif event_type == "proposal.denied":
         reasons = payload.get("reasons", [])
-        message = f"Proposal {proposal_id[:8]}... was denied.\nReasons: {', '.join(reasons)}"
+        message = f"Proposal {short_id}... was denied."
+        if reasons:
+            message += f"\nReasons: {', '.join(reasons)}"
+
     else:
         message = json.dumps(payload, indent=2)[:200]
 
     # Console notification (always)
-    print(f"\n{'='*50}")
-    print(f"[{timestamp}] {title}")
-    print(f"{message}")
-    print(f"{'='*50}\n", flush=True)
+    border = "=" * 50
+    print(f"\n{border}", flush=True)
+    print(f"[{timestamp}] {emoji} {title}" + (" ⚠️" if priority == "high" else ""), flush=True)
+    print(f"{message}", flush=True)
+    print(f"{border}\n", flush=True)
 
     # Webhook notification (if configured)
     if WEBHOOK_URL:
@@ -76,9 +108,12 @@ def send_notification(event_type: str, payload: dict) -> None:
                 WEBHOOK_URL,
                 json={
                     "event": event_type,
+                    "emoji": emoji,
                     "title": title,
+                    "priority": priority,
                     "message": message,
                     "proposal_id": proposal_id,
+                    "job_id": job_id,
                     "timestamp": timestamp,
                 },
                 timeout=5,
@@ -88,7 +123,8 @@ def send_notification(event_type: str, payload: dict) -> None:
 
 
 def main():
-    print("🚀 M87 Notifier starting...", flush=True)
+    print("🔔 M87 Notifier V1.2 starting...", flush=True)
+    print(f"   Watching: {list(NOTIFY_EVENTS.keys())}", flush=True)
 
     rdb = Redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -102,7 +138,7 @@ def main():
             time.sleep(2)
 
     setup_consumer_group(rdb)
-    print(f"📡 Listening on stream: {STREAM_KEY}", flush=True)
+    print(f"📡 Listening on stream: {EVENT_STREAM}", flush=True)
 
     while True:
         try:
@@ -110,7 +146,7 @@ def main():
             messages = rdb.xreadgroup(
                 CONSUMER_GROUP,
                 CONSUMER_NAME,
-                {STREAM_KEY: ">"},
+                {EVENT_STREAM: ">"},
                 count=10,
                 block=5000,  # 5 second timeout
             )
@@ -127,7 +163,7 @@ def main():
                         send_notification(event_type, payload)
 
                     # Acknowledge message
-                    rdb.xack(STREAM_KEY, CONSUMER_GROUP, msg_id)
+                    rdb.xack(EVENT_STREAM, CONSUMER_GROUP, msg_id)
 
         except Exception as e:
             print(f"[ERROR] {e}", flush=True)

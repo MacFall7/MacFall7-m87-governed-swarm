@@ -6,6 +6,9 @@ services:
     restart: unless-stopped
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
 
   api:
     build:
@@ -15,6 +18,8 @@ services:
       - "8000:8000"
     environment:
       - REDIS_URL=redis://redis:6379/0
+      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
     depends_on:
       - redis
     restart: unless-stopped
@@ -25,6 +30,8 @@ services:
       dockerfile: infra/Dockerfile.runner
     environment:
       - REDIS_URL=redis://redis:6379/0
+      - API_BASE=http://api:8000
+      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
     depends_on:
       - api
       - redis
@@ -37,6 +44,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - API_BASE=http://api:8000
+      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
     depends_on:
       - api
       - redis
@@ -48,6 +56,12 @@ services:
       dockerfile: infra/Dockerfile.ui
     ports:
       - "3000:3000"
+    environment:
+      - API_URL=http://api:8000
+      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
     depends_on:
       - api
     restart: unless-stopped
+
+volumes:
+  redis_data:
