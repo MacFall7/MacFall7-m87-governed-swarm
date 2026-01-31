@@ -83,5 +83,57 @@ services:
       - api
     restart: unless-stopped
 
+  # ---- V1.3: Agent Adapters ----
+  # Adapters propose actions but cannot execute or approve.
+  # Server enforces effect scopes; adapters are just proposal generators.
+
+  casey-adapter:
+    build:
+      context: ..
+      dockerfile: services/casey-adapter/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - M87_API_BASE=http://api:8000
+      - POLL_INTERVAL=5
+      - LOG_LEVEL=INFO
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  jordan-adapter:
+    build:
+      context: ..
+      dockerfile: services/jordan-adapter/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - M87_API_BASE=http://api:8000
+      - POLL_INTERVAL=5
+      - LOG_LEVEL=INFO
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  riley-adapter:
+    build:
+      context: ..
+      dockerfile: services/riley-adapter/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - M87_API_BASE=http://api:8000
+      - POLL_INTERVAL=5
+      - LOG_LEVEL=INFO
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   redis_data:

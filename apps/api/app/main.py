@@ -1,13 +1,13 @@
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional, Literal, Dict, Any
+from typing import List, Optional, Literal, Dict, Any, Set
 import os
 import json
 import uuid
 from redis import Redis
 
-app = FastAPI(title="m87-governed-swarm-api", version="0.1.2")
+app = FastAPI(title="m87-governed-swarm-api", version="0.1.3")
 
 # ---- Config
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -27,12 +27,50 @@ app.add_middleware(
 # ---- Redis connection
 rdb = Redis.from_url(REDIS_URL, decode_responses=True)
 
-# Stream keys - V1.2: separate events from jobs
+# Stream keys
 EVENT_STREAM = "m87:events"
 JOB_STREAM = "m87:jobs"
 
 # Runner tool allowlist
 ALLOWED_TOOLS = {"echo", "pytest", "git", "build"}
+
+
+# ---- V1.3: Agent Profiles (effect scopes + risk thresholds)
+# Agents can ONLY propose effects in their allowed set.
+# Server-side enforcement - adapters can hint but governance is law.
+AGENT_PROFILES: Dict[str, Dict[str, Any]] = {
+    "Casey": {
+        "allowed_effects": {"READ_REPO", "WRITE_PATCH", "RUN_TESTS"},
+        "max_risk": 0.6,
+        "description": "Code changes and testing",
+    },
+    "Jordan": {
+        "allowed_effects": {"SEND_NOTIFICATION", "BUILD_ARTIFACT", "CREATE_PR", "READ_REPO"},
+        "max_risk": 0.5,
+        "description": "Artifacts, notifications, PRs",
+    },
+    "Riley": {
+        "allowed_effects": {"READ_REPO", "BUILD_ARTIFACT", "SEND_NOTIFICATION"},
+        "max_risk": 0.4,
+        "description": "Analysis and reporting",
+    },
+    # Human/manual proposals have full access (still subject to DEPLOY/SECRETS rules)
+    "Human": {
+        "allowed_effects": {
+            "READ_REPO", "WRITE_PATCH", "RUN_TESTS", "BUILD_ARTIFACT",
+            "NETWORK_CALL", "SEND_NOTIFICATION", "CREATE_PR", "MERGE", "DEPLOY"
+        },
+        "max_risk": 1.0,
+        "description": "Manual human proposals",
+    },
+}
+
+# Default profile for unknown agents (restrictive)
+DEFAULT_AGENT_PROFILE = {
+    "allowed_effects": {"READ_REPO"},
+    "max_risk": 0.3,
+    "description": "Unknown agent (restricted)",
+}
 
 
 # ---- Auth middleware
@@ -136,20 +174,62 @@ def enqueue_job(proposal_id: str, tool: str, inputs: Dict[str, Any] = None) -> s
     return job_id
 
 
+def get_agent_profile(agent: str) -> Dict[str, Any]:
+    """Get agent profile, returns default for unknown agents."""
+    return AGENT_PROFILES.get(agent, DEFAULT_AGENT_PROFILE)
+
+
+def check_agent_effects(agent: str, effects: List[str]) -> tuple[bool, Set[str]]:
+    """
+    Check if agent is allowed to propose these effects.
+    Returns (all_allowed, disallowed_effects).
+    """
+    profile = get_agent_profile(agent)
+    allowed = profile["allowed_effects"]
+    requested = set(effects)
+    disallowed = requested - allowed
+    return len(disallowed) == 0, disallowed
+
+
+def check_agent_risk(agent: str, risk_score: Optional[float]) -> tuple[bool, float]:
+    """
+    Check if proposal risk is within agent's threshold.
+    Returns (within_threshold, max_allowed).
+    """
+    profile = get_agent_profile(agent)
+    max_risk = profile["max_risk"]
+    if risk_score is None:
+        return True, max_risk
+    return risk_score <= max_risk, max_risk
+
+
 # ---- Endpoints
 
 @app.get("/health")
 def health():
     try:
         rdb.ping()
-        return {"ok": True, "redis": "connected", "version": "0.1.2"}
+        return {"ok": True, "redis": "connected", "version": "0.1.3"}
     except Exception:
         return {"ok": False, "redis": "disconnected"}
 
 
+@app.get("/v1/agents")
+def list_agents():
+    """List registered agent profiles and their effect scopes."""
+    agents = []
+    for name, profile in AGENT_PROFILES.items():
+        agents.append({
+            "name": name,
+            "allowed_effects": sorted(profile["allowed_effects"]),
+            "max_risk": profile["max_risk"],
+            "description": profile["description"],
+        })
+    return {"agents": agents}
+
+
 @app.post("/v1/intent")
 def create_intent(intent: Intent, _: bool = Header(None, alias="X-M87-Key")):
-    # Intent creation doesn't require auth in v1.2 (for demo), but could
     emit("intent.created", intent.model_dump(by_alias=True))
     return {"accepted": True, "intent_id": intent.intent_id}
 
@@ -158,23 +238,67 @@ def create_intent(intent: Intent, _: bool = Header(None, alias="X-M87-Key")):
 def govern_proposal(proposal: Proposal):
     """
     Governance gate. Decides ALLOW/DENY/REQUIRE_HUMAN.
+
+    V1.3 Policy rules (in order):
+    1. READ_SECRETS → DENY (absolute)
+    2. Agent effect scope violation → DENY
+    3. Agent risk threshold exceeded → REQUIRE_HUMAN
+    4. DEPLOY → REQUIRE_HUMAN
+    5. Otherwise → ALLOW
+
     If ALLOW: immediately mints a job.
     If REQUIRE_HUMAN: stores pending, job minted on approval.
     """
     reasons: List[str] = []
+    agent = proposal.agent
 
-    # Policy: READ_SECRETS is forbidden
+    # Rule 1: READ_SECRETS is absolutely forbidden
     if "READ_SECRETS" in proposal.effects:
-        reasons.append("READ_SECRETS is forbidden in v1 policy.")
+        reasons.append("READ_SECRETS is forbidden.")
         decision = GovernanceDecision(
             proposal_id=proposal.proposal_id,
             decision="DENY",
             reasons=reasons,
         )
-        emit("proposal.denied", decision.model_dump())
+        emit("proposal.denied", {**decision.model_dump(), "agent": agent})
         return decision
 
-    # Policy: DEPLOY requires human approval
+    # Rule 2: Check agent effect scope
+    effects_allowed, disallowed_effects = check_agent_effects(agent, proposal.effects)
+    if not effects_allowed:
+        reasons.append(f"Agent '{agent}' not allowed effects: {sorted(disallowed_effects)}")
+        decision = GovernanceDecision(
+            proposal_id=proposal.proposal_id,
+            decision="DENY",
+            reasons=reasons,
+        )
+        emit("proposal.denied", {**decision.model_dump(), "agent": agent})
+        return decision
+
+    # Rule 3: Check agent risk threshold
+    risk_allowed, max_risk = check_agent_risk(agent, proposal.risk_score)
+    if not risk_allowed:
+        reasons.append(f"Risk {proposal.risk_score} exceeds agent '{agent}' max {max_risk}. Requires human review.")
+        decision = GovernanceDecision(
+            proposal_id=proposal.proposal_id,
+            decision="REQUIRE_HUMAN",
+            reasons=reasons,
+            required_approvals=["mac"],
+            allowed_effects=proposal.effects,
+        )
+        emit("proposal.needs_approval", {
+            **decision.model_dump(),
+            "summary": proposal.summary,
+            "agent": agent,
+            "risk_score": proposal.risk_score,
+        })
+        rdb.hset(f"m87:pending:{proposal.proposal_id}", mapping={
+            "proposal": json.dumps(proposal.model_dump()),
+            "decision": json.dumps(decision.model_dump()),
+        })
+        return decision
+
+    # Rule 4: DEPLOY requires human approval
     if "DEPLOY" in proposal.effects:
         reasons.append("DEPLOY requires human approval.")
         decision = GovernanceDecision(
@@ -187,30 +311,29 @@ def govern_proposal(proposal: Proposal):
         emit("proposal.needs_approval", {
             **decision.model_dump(),
             "summary": proposal.summary,
-            "agent": proposal.agent,
+            "agent": agent,
         })
-        # Store pending proposal data for later job creation
         rdb.hset(f"m87:pending:{proposal.proposal_id}", mapping={
             "proposal": json.dumps(proposal.model_dump()),
             "decision": json.dumps(decision.model_dump()),
         })
         return decision
 
-    # ALLOW - mint job immediately
-    reasons.append("Allowed by v1 policy.")
+    # Rule 5: ALLOW - mint job immediately
+    reasons.append(f"Allowed by policy. Agent '{agent}' within scope.")
     decision = GovernanceDecision(
         proposal_id=proposal.proposal_id,
         decision="ALLOW",
         reasons=reasons,
         allowed_effects=proposal.effects,
     )
-    emit("proposal.allowed", decision.model_dump())
+    emit("proposal.allowed", {**decision.model_dump(), "agent": agent})
 
     # Mint the job
-    job_id = enqueue_job(
+    enqueue_job(
         proposal_id=proposal.proposal_id,
-        tool="echo",  # V1.2: safe default tool
-        inputs={"message": f"Executing: {proposal.summary}"}
+        tool="echo",
+        inputs={"message": f"[{agent}] {proposal.summary}"}
     )
 
     return decision
@@ -221,7 +344,6 @@ def approve(proposal_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M
     """Human approves a pending proposal. Mints the job."""
     verify_api_key(x_m87_key)
 
-    # Check if pending
     pending_key = f"m87:pending:{proposal_id}"
     pending_data = rdb.hgetall(pending_key)
 
@@ -230,18 +352,15 @@ def approve(proposal_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M
 
     proposal_data = json.loads(pending_data.get("proposal", "{}"))
 
-    # Emit approval event
     evt = {"proposal_id": proposal_id, "approved_by": "mac"}
     emit("proposal.approved", evt)
 
-    # Now mint the job
     job_id = enqueue_job(
         proposal_id=proposal_id,
         tool="echo",
         inputs={"message": f"Approved: {proposal_data.get('summary', 'unknown')}"}
     )
 
-    # Clean up pending
     rdb.delete(pending_key)
 
     return {"approved": True, "job_id": job_id, **evt}
@@ -257,7 +376,6 @@ def deny(proposal_id: str, reason: str = "Denied by human", x_m87_key: Optional[
     evt = {"proposal_id": proposal_id, "denied_by": "mac", "reason": reason}
     emit("proposal.denied_by_human", evt)
 
-    # Clean up pending
     rdb.delete(pending_key)
 
     return {"denied": True, **evt}
@@ -265,11 +383,7 @@ def deny(proposal_id: str, reason: str = "Denied by human", x_m87_key: Optional[
 
 @app.get("/v1/events")
 def list_events(limit: int = 200, after: Optional[str] = None):
-    """
-    Get events from stream.
-    - limit: max events to return
-    - after: stream ID to start after (for polling)
-    """
+    """Get events from stream."""
     if after:
         items = rdb.xrange(EVENT_STREAM, min=f"({after}", max="+", count=limit)
     else:
@@ -288,17 +402,10 @@ def list_events(limit: int = 200, after: Optional[str] = None):
 
 @app.get("/v1/jobs")
 def list_jobs(limit: int = 100, status: Optional[str] = None):
-    """
-    Get jobs from stream with derived status.
-    Status derived from events: pending -> running -> completed/failed
-    """
-    # Get all jobs
+    """Get jobs from stream with derived status."""
     job_items = rdb.xrevrange(JOB_STREAM, max="+", min="-", count=limit)
-
-    # Get recent events to derive job status
     event_items = rdb.xrevrange(EVENT_STREAM, max="+", min="-", count=500)
 
-    # Build job status map from events
     job_status = {}
     for _, fields in event_items:
         event_type = fields.get("type", "")
@@ -380,11 +487,7 @@ def runner_result(payload: Dict[str, Any], x_m87_key: Optional[str] = Header(Non
 
 @app.post("/v1/admin/emit")
 def admin_emit(payload: Dict[str, Any], x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
-    """
-    Admin endpoint to emit arbitrary events (for testing).
-    Used by proof test to verify runner ignores events stream.
-    Disabled by default - set M87_ENABLE_TEST_ENDPOINTS=true to enable.
-    """
+    """Admin endpoint to emit arbitrary events (for testing)."""
     if not ENABLE_TEST_ENDPOINTS:
         raise HTTPException(status_code=404, detail="Not found")
 
