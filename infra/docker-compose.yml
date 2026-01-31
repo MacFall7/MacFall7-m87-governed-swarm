@@ -4,11 +4,22 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    # No public port - internal only for security
     volumes:
       - redis_data:/data
-    command: ["redis-server", "--appendonly", "yes"]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --auto-aof-rewrite-percentage
+      - "100"
+      - --auto-aof-rewrite-min-size
+      - "64mb"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   api:
     build:
@@ -21,8 +32,14 @@ services:
       - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   runner:
     build:
@@ -33,8 +50,10 @@ services:
       - API_BASE=http://api:8000
       - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
     depends_on:
-      - api
-      - redis
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   notifier:
@@ -45,9 +64,12 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - API_BASE=http://api:8000
       - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
+      - WEBHOOK_URL=${WEBHOOK_URL:-}
     depends_on:
-      - api
-      - redis
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   ui:
@@ -56,9 +78,6 @@ services:
       dockerfile: infra/Dockerfile.ui
     ports:
       - "3000:3000"
-    environment:
-      - API_URL=http://api:8000
-      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
     depends_on:
       - api
     restart: unless-stopped
