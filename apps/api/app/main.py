@@ -235,9 +235,13 @@ def create_intent(intent: Intent, _: bool = Header(None, alias="X-M87-Key")):
 
 
 @app.post("/v1/govern/proposal", response_model=GovernanceDecision)
-def govern_proposal(proposal: Proposal):
+def govern_proposal(
+    proposal: Proposal,
+    x_m87_key: Optional[str] = Header(None, alias="X-M87-Key"),
+):
     """
     Governance gate. Decides ALLOW/DENY/REQUIRE_HUMAN.
+    Requires API key - proposals are mutations by authorized principals only.
 
     V1.3 Policy rules (in order):
     1. READ_SECRETS → DENY (absolute)
@@ -249,6 +253,8 @@ def govern_proposal(proposal: Proposal):
     If ALLOW: immediately mints a job.
     If REQUIRE_HUMAN: stores pending, job minted on approval.
     """
+    verify_api_key(x_m87_key)
+
     reasons: List[str] = []
     agent = proposal.agent
 
