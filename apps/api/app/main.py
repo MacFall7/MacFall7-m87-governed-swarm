@@ -1,10 +1,27 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal, Dict, Any
-import uuid
-import time
+import os
+import json
+from redis import Redis
 
-app = FastAPI(title="m87-governed-swarm-api", version="0.1.0")
+app = FastAPI(title="m87-governed-swarm-api", version="0.1.1")
+
+# CORS for dashboard
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---- Redis connection
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+rdb = Redis.from_url(REDIS_URL, decode_responses=True)
+
+STREAM_KEY = "m87:events"
 
 
 # ---- Minimal in-service models (v1). We'll later generate from shared schemas.
@@ -56,17 +73,20 @@ class GovernanceDecision(BaseModel):
     allowed_effects: Optional[List[EffectTag]] = None
 
 
-# ---- In-memory event log (v1). We'll move to Postgres/Redis streams next.
-EVENTS: List[Dict[str, Any]] = []
-
-
-def emit(event_type: str, payload: Dict[str, Any]) -> None:
-    EVENTS.append({"ts": time.time(), "type": event_type, "payload": payload})
+# ---- Event emission via Redis Streams
+def emit(event_type: str, payload: Dict[str, Any]) -> str:
+    """Emit event to Redis stream, returns event ID."""
+    event_id = rdb.xadd(STREAM_KEY, {"type": event_type, "payload": json.dumps(payload)})
+    return event_id
 
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    try:
+        rdb.ping()
+        return {"ok": True, "redis": "connected"}
+    except Exception:
+        return {"ok": False, "redis": "disconnected"}
 
 
 @app.post("/v1/intent")
@@ -78,10 +98,6 @@ def create_intent(intent: Intent):
 @app.post("/v1/govern/proposal", response_model=GovernanceDecision)
 def govern_proposal(proposal: Proposal):
     reasons: List[str] = []
-
-    constraints = None
-    # In v1 we don't persist intents yet; allow constraint overrides via proposal artifacts later.
-    # Keep simple.
 
     if "READ_SECRETS" in proposal.effects:
         reasons.append("READ_SECRETS is forbidden in v1 policy.")
@@ -118,15 +134,70 @@ def govern_proposal(proposal: Proposal):
 
 @app.post("/v1/approve/{proposal_id}")
 def approve(proposal_id: str):
-    # v1: approval just emits an event; runner will listen later
     evt = {"proposal_id": proposal_id, "approved_by": "mac"}
     emit("proposal.approved", evt)
     return {"approved": True, **evt}
 
 
+@app.post("/v1/deny/{proposal_id}")
+def deny(proposal_id: str, reason: str = "Denied by human"):
+    evt = {"proposal_id": proposal_id, "denied_by": "mac", "reason": reason}
+    emit("proposal.denied_by_human", evt)
+    return {"denied": True, **evt}
+
+
 @app.get("/v1/events")
-def list_events(limit: int = 200):
-    return {"events": EVENTS[-limit:]}
+def list_events(limit: int = 200, after: Optional[str] = None):
+    """
+    Get events from stream.
+    - limit: max events to return
+    - after: stream ID to start after (for polling)
+    """
+    if after:
+        # Streaming mode: get events after cursor
+        items = rdb.xrange(STREAM_KEY, min=f"({after}", max="+", count=limit)
+    else:
+        # Timeline mode: get latest events (newest last)
+        items = rdb.xrevrange(STREAM_KEY, max="+", min="-", count=limit)
+        items = list(reversed(items))
+
+    events = []
+    for event_id, fields in items:
+        events.append({
+            "id": event_id,
+            "type": fields.get("type"),
+            "payload": json.loads(fields.get("payload") or "{}")
+        })
+    return {"events": events}
+
+
+@app.get("/v1/pending-approvals")
+def pending_approvals():
+    """Get proposals awaiting human approval."""
+    items = rdb.xrevrange(STREAM_KEY, max="+", min="-", count=1000)
+
+    needs_approval = {}
+    resolved = set()
+
+    for event_id, fields in items:
+        event_type = fields.get("type")
+        payload = json.loads(fields.get("payload") or "{}")
+        proposal_id = payload.get("proposal_id")
+
+        if not proposal_id:
+            continue
+
+        if event_type in ("proposal.approved", "proposal.denied_by_human"):
+            resolved.add(proposal_id)
+        elif event_type == "proposal.needs_approval" and proposal_id not in resolved:
+            if proposal_id not in needs_approval:
+                needs_approval[proposal_id] = {
+                    "id": event_id,
+                    "proposal_id": proposal_id,
+                    "payload": payload
+                }
+
+    return {"pending": list(needs_approval.values())}
 
 
 @app.post("/v1/runner/result")

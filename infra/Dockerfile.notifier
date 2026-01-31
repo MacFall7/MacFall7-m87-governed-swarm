@@ -1,0 +1,8 @@
+FROM python:3.11-slim
+
+WORKDIR /notifier
+COPY services/notifier/requirements.txt /notifier/requirements.txt
+RUN pip install --no-cache-dir -r /notifier/requirements.txt
+
+COPY services/notifier/app /notifier/app
+CMD ["python", "-u", "app/notifier.py"]
