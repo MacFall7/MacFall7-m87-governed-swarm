@@ -94,6 +94,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - M87_API_BASE=http://api:8000
+      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
       - POLL_INTERVAL=5
       - LOG_LEVEL=INFO
     depends_on:
@@ -110,6 +111,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - M87_API_BASE=http://api:8000
+      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
       - POLL_INTERVAL=5
       - LOG_LEVEL=INFO
     depends_on:
@@ -126,6 +128,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - M87_API_BASE=http://api:8000
+      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
       - POLL_INTERVAL=5
       - LOG_LEVEL=INFO
     depends_on:

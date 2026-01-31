@@ -35,6 +35,7 @@ from adapter_sdk import (
 # ---- Config
 AGENT_NAME = "Casey"
 API_BASE = os.getenv("M87_API_BASE", "http://api:8000")
+API_KEY = os.getenv("M87_API_KEY")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -60,7 +61,7 @@ class CaseyAdapter:
     """
 
     def __init__(self):
-        self.client = M87Client(api_base=API_BASE)
+        self.client = M87Client(api_base=API_BASE, api_key=API_KEY)
         self.redis = Redis.from_url(REDIS_URL, decode_responses=True)
         self.last_event_id: Optional[str] = None
         self.proposals_submitted = 0

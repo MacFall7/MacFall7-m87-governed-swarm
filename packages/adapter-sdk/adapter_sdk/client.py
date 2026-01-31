@@ -42,8 +42,8 @@ class M87Client:
         self.timeout = timeout
         self._client = httpx.Client(timeout=timeout)
 
-    def _headers(self, authenticated: bool = False) -> Dict[str, str]:
-        """Get headers for requests."""
+    def _headers(self, authenticated: bool = True) -> Dict[str, str]:
+        """Get headers for requests. Includes API key by default if available."""
         headers = {"Content-Type": "application/json"}
         if authenticated and self.api_key:
             headers["X-M87-Key"] = self.api_key
