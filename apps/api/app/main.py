@@ -375,3 +375,21 @@ def runner_result(payload: Dict[str, Any], x_m87_key: Optional[str] = Header(Non
         emit("job.failed", payload)
 
     return {"ok": True}
+
+
+@app.post("/v1/admin/emit")
+def admin_emit(payload: Dict[str, Any], x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
+    """
+    Admin endpoint to emit arbitrary events (for testing).
+    Used by proof test to verify runner ignores events stream.
+    """
+    verify_api_key(x_m87_key)
+
+    event_type = payload.get("type")
+    data = payload.get("payload", {})
+
+    if not event_type:
+        raise HTTPException(status_code=400, detail="Missing event type")
+
+    emit(event_type, data)
+    return {"ok": True, "emitted": event_type}
