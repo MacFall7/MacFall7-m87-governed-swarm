@@ -968,3 +968,104 @@ def admin_emit(payload: Dict[str, Any], x_m87_key: Optional[str] = Header(None, 
 
     emit(event_type, data)
     return {"ok": True, "emitted": event_type}
+
+
+# ---- Test endpoints (for verification scripts, gated by M87_ENABLE_TEST_ENDPOINTS)
+
+@app.get("/v1/test/db/proposals/{proposal_id}")
+def test_db_proposal_exists(
+    proposal_id: str,
+    x_m87_key: Optional[str] = Header(None, alias="X-M87-Key"),
+):
+    """
+    Test endpoint: Check if proposal exists in Postgres.
+
+    Used by verification scripts to prove DB durability without psql.
+    Only available when M87_ENABLE_TEST_ENDPOINTS=true.
+    """
+    if not ENABLE_TEST_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    verify_auth(x_m87_key, "admin:keys")
+
+    if not _db_available:
+        return {"exists": False, "error": "DB_UNAVAILABLE"}
+
+    from .db import get_db, Proposal
+    try:
+        with get_db(required=False) as db:
+            if db is None:
+                return {"exists": False, "error": "DB_UNAVAILABLE"}
+            proposal = db.query(Proposal).filter(Proposal.proposal_id == proposal_id).first()
+            return {
+                "exists": proposal is not None,
+                "proposal_id": proposal_id,
+            }
+    except Exception as e:
+        return {"exists": False, "error": str(e)}
+
+
+@app.get("/v1/test/db/decisions/{proposal_id}")
+def test_db_decision_exists(
+    proposal_id: str,
+    x_m87_key: Optional[str] = Header(None, alias="X-M87-Key"),
+):
+    """
+    Test endpoint: Check if decision exists for proposal in Postgres.
+
+    Used by verification scripts to prove DB durability without psql.
+    """
+    if not ENABLE_TEST_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    verify_auth(x_m87_key, "admin:keys")
+
+    if not _db_available:
+        return {"exists": False, "error": "DB_UNAVAILABLE"}
+
+    from .db import get_db, Decision
+    try:
+        with get_db(required=False) as db:
+            if db is None:
+                return {"exists": False, "error": "DB_UNAVAILABLE"}
+            decision = db.query(Decision).filter(Decision.proposal_id == proposal_id).first()
+            return {
+                "exists": decision is not None,
+                "proposal_id": proposal_id,
+                "outcome": decision.outcome if decision else None,
+            }
+    except Exception as e:
+        return {"exists": False, "error": str(e)}
+
+
+@app.get("/v1/test/db/jobs/{proposal_id}")
+def test_db_job_exists(
+    proposal_id: str,
+    x_m87_key: Optional[str] = Header(None, alias="X-M87-Key"),
+):
+    """
+    Test endpoint: Check if job exists for proposal in Postgres.
+
+    Used by verification scripts to prove DB durability without psql.
+    """
+    if not ENABLE_TEST_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    verify_auth(x_m87_key, "admin:keys")
+
+    if not _db_available:
+        return {"exists": False, "error": "DB_UNAVAILABLE"}
+
+    from .db import get_db, Job
+    try:
+        with get_db(required=False) as db:
+            if db is None:
+                return {"exists": False, "error": "DB_UNAVAILABLE"}
+            job = db.query(Job).filter(Job.proposal_id == proposal_id).first()
+            return {
+                "exists": job is not None,
+                "proposal_id": proposal_id,
+                "job_id": job.job_id if job else None,
+            }
+    except Exception as e:
+        return {"exists": False, "error": str(e)}

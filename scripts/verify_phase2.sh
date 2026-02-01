@@ -14,11 +14,30 @@
 # - curl, jq
 # - For full verification: Docker + running compose stack
 #
-# Usage: ./scripts/verify_phase2.sh [API_BASE]
+# Usage: ./scripts/verify_phase2.sh [--strict] [API_BASE]
+#
+# Exit codes:
+#   0 = PASSED (all tests passed)
+#   1 = FAILED (test failures)
+#   2 = PARTIAL (some tests skipped - use --strict to fail on skips)
 #
 set -euo pipefail
 
-API_BASE="${1:-http://localhost:8000}"
+# Parse args
+STRICT_MODE=false
+API_BASE="http://localhost:8000"
+
+for arg in "$@"; do
+    case $arg in
+        --strict)
+            STRICT_MODE=true
+            ;;
+        *)
+            API_BASE="$arg"
+            ;;
+    esac
+done
+
 API_KEY="${M87_API_KEY:-m87-dev-key-change-me}"
 
 RED='\033[0;31m'
@@ -146,9 +165,66 @@ else
 fi
 
 # ----------------------------------------------------------------
-# Test 3: Hard fail-safe documentation
+# Test 3: Verify DB durability via test endpoint (no psql required)
 # ----------------------------------------------------------------
-info "Test 3: Hard fail-safe (manual verification required)"
+info "Test 3: Verify proposal persisted to Postgres (via API)"
+TESTS_RUN=$((TESTS_RUN + 1))
+
+if echo "$HEALTH_RESP" | jq -e '._error == "CONNECTION_REFUSED"' > /dev/null 2>&1; then
+    skip "DB durability check" "API_UNREACHABLE"
+elif [ -z "${PROPOSAL_ID:-}" ]; then
+    skip "DB durability check" "no proposal created"
+else
+    # Try the test endpoint (requires M87_ENABLE_TEST_ENDPOINTS=true)
+    DB_RESP=$(curl -s "${API_BASE}/v1/test/db/proposals/${PROPOSAL_ID}" \
+        -H "X-M87-Key: ${API_KEY}" 2>/dev/null || echo '{"error": "REQUEST_FAILED"}')
+
+    if echo "$DB_RESP" | jq -e '.error == "REQUEST_FAILED"' > /dev/null 2>&1; then
+        skip "DB durability check" "test endpoint request failed"
+    elif echo "$DB_RESP" | jq -e '.detail == "Not found"' > /dev/null 2>&1; then
+        skip "DB durability check" "M87_ENABLE_TEST_ENDPOINTS not enabled"
+    else
+        EXISTS=$(echo "$DB_RESP" | jq -r '.exists // false')
+        if [ "$EXISTS" = "true" ]; then
+            pass "Proposal $PROPOSAL_ID exists in Postgres"
+        else
+            ERROR=$(echo "$DB_RESP" | jq -r '.error // "unknown"')
+            fail "DB_DURABILITY_FAILED: proposal not found in Postgres (error: $ERROR)"
+        fi
+    fi
+fi
+
+# ----------------------------------------------------------------
+# Test 4: Verify decision persisted via test endpoint
+# ----------------------------------------------------------------
+info "Test 4: Verify decision persisted to Postgres (via API)"
+TESTS_RUN=$((TESTS_RUN + 1))
+
+if echo "$HEALTH_RESP" | jq -e '._error == "CONNECTION_REFUSED"' > /dev/null 2>&1; then
+    skip "Decision durability check" "API_UNREACHABLE"
+elif [ -z "${PROPOSAL_ID:-}" ]; then
+    skip "Decision durability check" "no proposal created"
+else
+    DB_RESP=$(curl -s "${API_BASE}/v1/test/db/decisions/${PROPOSAL_ID}" \
+        -H "X-M87-Key: ${API_KEY}" 2>/dev/null || echo '{"error": "REQUEST_FAILED"}')
+
+    if echo "$DB_RESP" | jq -e '.detail == "Not found"' > /dev/null 2>&1; then
+        skip "Decision durability check" "M87_ENABLE_TEST_ENDPOINTS not enabled"
+    else
+        EXISTS=$(echo "$DB_RESP" | jq -r '.exists // false')
+        if [ "$EXISTS" = "true" ]; then
+            OUTCOME=$(echo "$DB_RESP" | jq -r '.outcome // "unknown"')
+            pass "Decision for $PROPOSAL_ID exists in Postgres (outcome: $OUTCOME)"
+        else
+            skip "Decision durability check" "test endpoint not available or decision not found"
+        fi
+    fi
+fi
+
+# ----------------------------------------------------------------
+# Test 5: Hard fail-safe documentation
+# ----------------------------------------------------------------
+info "Test 5: Hard fail-safe (manual verification required)"
 echo ""
 echo "  To verify hard fail-safe, stop Postgres and confirm 503:"
 echo ""
@@ -187,9 +263,16 @@ TESTS_FAILED=$((TESTS_RUN - TESTS_PASSED - TESTS_SKIPPED))
 if [ "$TESTS_FAILED" -gt 0 ]; then
     echo "RESULT: FAILED ($TESTS_FAILED failures)"
     exit 1
-elif [ "$TESTS_PASSED" -eq 0 ]; then
-    echo "RESULT: INCOMPLETE (all tests skipped)"
-    exit 0
+elif [ "$TESTS_SKIPPED" -gt 0 ]; then
+    if [ "$STRICT_MODE" = true ]; then
+        echo "RESULT: FAILED (strict mode - $TESTS_SKIPPED skipped tests treated as failures)"
+        exit 1
+    else
+        echo "RESULT: PARTIAL ($TESTS_SKIPPED tests skipped)"
+        echo ""
+        echo "Use --strict flag to fail on skipped tests (for CI gates)"
+        exit 2
+    fi
 else
     echo "RESULT: PASSED"
     exit 0
