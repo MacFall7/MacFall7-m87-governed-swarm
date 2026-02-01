@@ -5,13 +5,26 @@ from typing import List, Optional, Literal, Dict, Any, Set
 import os
 import json
 import uuid
+import logging
 from redis import Redis
 
-app = FastAPI(title="m87-governed-swarm-api", version="0.1.3")
+from .auth import (
+    KeyStore,
+    KeyVerifier,
+    AuthDecision,
+    AuthReasonCode,
+    emit_auth_event,
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="m87-governed-swarm-api", version="0.2.0")
 
 # ---- Config
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-API_KEY = os.getenv("M87_API_KEY", "m87-dev-key-change-me")
+BOOTSTRAP_KEY = os.getenv("M87_API_KEY", "m87-dev-key-change-me")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
 ENABLE_TEST_ENDPOINTS = os.getenv("M87_ENABLE_TEST_ENDPOINTS", "false").lower() == "true"
 
@@ -20,12 +33,16 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
 # ---- Redis connection
 rdb = Redis.from_url(REDIS_URL, decode_responses=True)
+
+# ---- Auth system (V2.0 - scoped keys)
+key_store = KeyStore(rdb)
+key_verifier = KeyVerifier(key_store)
 
 # Stream keys
 EVENT_STREAM = "m87:events"
@@ -36,8 +53,6 @@ ALLOWED_TOOLS = {"echo", "pytest", "git", "build"}
 
 
 # ---- V1.3: Agent Profiles (effect scopes + risk thresholds)
-# Agents can ONLY propose effects in their allowed set.
-# Server-side enforcement - adapters can hint but governance is law.
 AGENT_PROFILES: Dict[str, Dict[str, Any]] = {
     "Casey": {
         "allowed_effects": {"READ_REPO", "WRITE_PATCH", "RUN_TESTS"},
@@ -54,7 +69,6 @@ AGENT_PROFILES: Dict[str, Dict[str, Any]] = {
         "max_risk": 0.4,
         "description": "Analysis and reporting",
     },
-    # Human/manual proposals have full access (still subject to DEPLOY/SECRETS rules)
     "Human": {
         "allowed_effects": {
             "READ_REPO", "WRITE_PATCH", "RUN_TESTS", "BUILD_ARTIFACT",
@@ -65,7 +79,6 @@ AGENT_PROFILES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# Default profile for unknown agents (restrictive)
 DEFAULT_AGENT_PROFILE = {
     "allowed_effects": {"READ_REPO"},
     "max_risk": 0.3,
@@ -73,12 +86,70 @@ DEFAULT_AGENT_PROFILE = {
 }
 
 
-# ---- Auth middleware
-def verify_api_key(x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")) -> bool:
-    """Verify API key for protected endpoints."""
-    if not x_m87_key or x_m87_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    return True
+# ---- Event + Job emission (defined early for use in auth)
+def emit(event_type: str, payload: Dict[str, Any]) -> str:
+    """Emit event to Redis stream, returns event ID."""
+    event_id = rdb.xadd(EVENT_STREAM, {"type": event_type, "payload": json.dumps(payload)})
+    return event_id
+
+
+# ---- Startup: Seed bootstrap key
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the system on startup."""
+    logger.info("M87 API starting up...")
+
+    # Check Redis connection
+    try:
+        rdb.ping()
+        logger.info("Redis connection OK")
+    except Exception as e:
+        logger.error(f"Redis connection failed: {e}")
+        raise
+
+    # Seed bootstrap key if it doesn't exist
+    existing = key_store.get_by_plaintext(BOOTSTRAP_KEY)
+    if not existing:
+        record = key_store.seed_bootstrap_key(BOOTSTRAP_KEY)
+        logger.info(f"Bootstrap key seeded: {record.key_id}")
+    else:
+        logger.info(f"Bootstrap key already exists: {existing.key_id}")
+
+    logger.info("M87 API ready")
+
+
+# ---- Auth helper
+def verify_auth(
+    x_m87_key: Optional[str],
+    endpoint_scope: str,
+    requested_effects: Optional[Set[str]] = None,
+    risk_score: Optional[float] = None,
+) -> AuthDecision:
+    """
+    Verify authentication and authorization for an endpoint.
+
+    Raises HTTPException on failure.
+    Returns AuthDecision on success (for logging principal info).
+    """
+    decision = key_verifier.verify(
+        plaintext_key=x_m87_key,
+        endpoint_scope=endpoint_scope,
+        requested_effects=requested_effects,
+        risk_score=risk_score,
+    )
+
+    # Log the auth decision
+    emit_auth_event(decision, endpoint_scope, emit)
+
+    if not decision.allowed:
+        # Map reason codes to HTTP status codes
+        if decision.reason_code in (AuthReasonCode.MISSING_KEY, AuthReasonCode.INVALID_KEY):
+            raise HTTPException(status_code=401, detail=decision.reason)
+        else:
+            # Scope/permission errors are 403
+            raise HTTPException(status_code=403, detail=decision.reason)
+
+    return decision
 
 
 # ---- Minimal in-service models
@@ -140,13 +211,16 @@ class JobSpec(BaseModel):
     timeout_seconds: int = 60
 
 
-# ---- Event + Job emission
-def emit(event_type: str, payload: Dict[str, Any]) -> str:
-    """Emit event to Redis stream, returns event ID."""
-    event_id = rdb.xadd(EVENT_STREAM, {"type": event_type, "payload": json.dumps(payload)})
-    return event_id
+class CreateKeyRequest(BaseModel):
+    principal_type: str
+    principal_id: str
+    endpoint_scopes: List[str]
+    effect_scopes: Optional[List[str]] = None
+    max_risk: float = 1.0
+    description: Optional[str] = None
 
 
+# ---- Job minting
 def enqueue_job(proposal_id: str, tool: str, inputs: Dict[str, Any] = None) -> str:
     """
     Mint a JobSpec and add to jobs stream.
@@ -165,10 +239,7 @@ def enqueue_job(proposal_id: str, tool: str, inputs: Dict[str, Any] = None) -> s
         "timeout_seconds": 60,
     }
 
-    # Add to jobs stream
     rdb.xadd(JOB_STREAM, {"job": json.dumps(job)})
-
-    # Emit event that job was created
     emit("job.created", {"job_id": job_id, "proposal_id": proposal_id, "tool": tool})
 
     return job_id
@@ -180,10 +251,7 @@ def get_agent_profile(agent: str) -> Dict[str, Any]:
 
 
 def check_agent_effects(agent: str, effects: List[str]) -> tuple[bool, Set[str]]:
-    """
-    Check if agent is allowed to propose these effects.
-    Returns (all_allowed, disallowed_effects).
-    """
+    """Check if agent is allowed to propose these effects."""
     profile = get_agent_profile(agent)
     allowed = profile["allowed_effects"]
     requested = set(effects)
@@ -192,10 +260,7 @@ def check_agent_effects(agent: str, effects: List[str]) -> tuple[bool, Set[str]]
 
 
 def check_agent_risk(agent: str, risk_score: Optional[float]) -> tuple[bool, float]:
-    """
-    Check if proposal risk is within agent's threshold.
-    Returns (within_threshold, max_allowed).
-    """
+    """Check if proposal risk is within agent's threshold."""
     profile = get_agent_profile(agent)
     max_risk = profile["max_risk"]
     if risk_score is None:
@@ -209,7 +274,7 @@ def check_agent_risk(agent: str, risk_score: Optional[float]) -> tuple[bool, flo
 def health():
     try:
         rdb.ping()
-        return {"ok": True, "redis": "connected", "version": "0.1.3"}
+        return {"ok": True, "redis": "connected", "version": "0.2.0"}
     except Exception:
         return {"ok": False, "redis": "disconnected"}
 
@@ -241,19 +306,28 @@ def govern_proposal(
 ):
     """
     Governance gate. Decides ALLOW/DENY/REQUIRE_HUMAN.
-    Requires API key - proposals are mutations by authorized principals only.
+    Requires scoped API key with proposal:create scope.
 
-    V1.3 Policy rules (in order):
+    V2.0 Auth checks (in order):
+    1. Key valid and enabled
+    2. Key has proposal:create scope
+    3. Key has effect scopes for requested effects
+    4. Risk <= key's max_risk
+
+    V1.3 Policy rules (after auth):
     1. READ_SECRETS → DENY (absolute)
     2. Agent effect scope violation → DENY
     3. Agent risk threshold exceeded → REQUIRE_HUMAN
     4. DEPLOY → REQUIRE_HUMAN
     5. Otherwise → ALLOW
-
-    If ALLOW: immediately mints a job.
-    If REQUIRE_HUMAN: stores pending, job minted on approval.
     """
-    verify_api_key(x_m87_key)
+    # V2.0: Scoped auth check
+    auth = verify_auth(
+        x_m87_key=x_m87_key,
+        endpoint_scope="proposal:create",
+        requested_effects=set(proposal.effects),
+        risk_score=proposal.risk_score,
+    )
 
     reasons: List[str] = []
     agent = proposal.agent
@@ -266,7 +340,11 @@ def govern_proposal(
             decision="DENY",
             reasons=reasons,
         )
-        emit("proposal.denied", {**decision.model_dump(), "agent": agent})
+        emit("proposal.denied", {
+            **decision.model_dump(),
+            "agent": agent,
+            "principal_id": auth.principal_id,
+        })
         return decision
 
     # Rule 2: Check agent effect scope
@@ -278,7 +356,11 @@ def govern_proposal(
             decision="DENY",
             reasons=reasons,
         )
-        emit("proposal.denied", {**decision.model_dump(), "agent": agent})
+        emit("proposal.denied", {
+            **decision.model_dump(),
+            "agent": agent,
+            "principal_id": auth.principal_id,
+        })
         return decision
 
     # Rule 3: Check agent risk threshold
@@ -297,6 +379,7 @@ def govern_proposal(
             "summary": proposal.summary,
             "agent": agent,
             "risk_score": proposal.risk_score,
+            "principal_id": auth.principal_id,
         })
         rdb.hset(f"m87:pending:{proposal.proposal_id}", mapping={
             "proposal": json.dumps(proposal.model_dump()),
@@ -318,6 +401,7 @@ def govern_proposal(
             **decision.model_dump(),
             "summary": proposal.summary,
             "agent": agent,
+            "principal_id": auth.principal_id,
         })
         rdb.hset(f"m87:pending:{proposal.proposal_id}", mapping={
             "proposal": json.dumps(proposal.model_dump()),
@@ -333,9 +417,12 @@ def govern_proposal(
         reasons=reasons,
         allowed_effects=proposal.effects,
     )
-    emit("proposal.allowed", {**decision.model_dump(), "agent": agent})
+    emit("proposal.allowed", {
+        **decision.model_dump(),
+        "agent": agent,
+        "principal_id": auth.principal_id,
+    })
 
-    # Mint the job
     enqueue_job(
         proposal_id=proposal.proposal_id,
         tool="echo",
@@ -347,8 +434,8 @@ def govern_proposal(
 
 @app.post("/v1/approve/{proposal_id}")
 def approve(proposal_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
-    """Human approves a pending proposal. Mints the job."""
-    verify_api_key(x_m87_key)
+    """Human approves a pending proposal. Requires proposal:approve scope."""
+    auth = verify_auth(x_m87_key, "proposal:approve")
 
     pending_key = f"m87:pending:{proposal_id}"
     pending_data = rdb.hgetall(pending_key)
@@ -358,7 +445,10 @@ def approve(proposal_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M
 
     proposal_data = json.loads(pending_data.get("proposal", "{}"))
 
-    evt = {"proposal_id": proposal_id, "approved_by": "mac"}
+    evt = {
+        "proposal_id": proposal_id,
+        "approved_by": auth.principal_id,
+    }
     emit("proposal.approved", evt)
 
     job_id = enqueue_job(
@@ -373,13 +463,21 @@ def approve(proposal_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M
 
 
 @app.post("/v1/deny/{proposal_id}")
-def deny(proposal_id: str, reason: str = "Denied by human", x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
-    """Human denies a pending proposal."""
-    verify_api_key(x_m87_key)
+def deny(
+    proposal_id: str,
+    reason: str = "Denied by human",
+    x_m87_key: Optional[str] = Header(None, alias="X-M87-Key"),
+):
+    """Human denies a pending proposal. Requires proposal:deny scope."""
+    auth = verify_auth(x_m87_key, "proposal:deny")
 
     pending_key = f"m87:pending:{proposal_id}"
 
-    evt = {"proposal_id": proposal_id, "denied_by": "mac", "reason": reason}
+    evt = {
+        "proposal_id": proposal_id,
+        "denied_by": auth.principal_id,
+        "reason": reason,
+    }
     emit("proposal.denied_by_human", evt)
 
     rdb.delete(pending_key)
@@ -477,8 +575,8 @@ def pending_approvals():
 
 @app.post("/v1/runner/result")
 def runner_result(payload: Dict[str, Any], x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
-    """Runner reports job completion/failure."""
-    verify_api_key(x_m87_key)
+    """Runner reports job completion/failure. Requires runner:result scope."""
+    verify_auth(x_m87_key, "runner:result")
 
     job_id = payload.get("job_id")
     status = payload.get("status", "completed")
@@ -491,13 +589,105 @@ def runner_result(payload: Dict[str, Any], x_m87_key: Optional[str] = Header(Non
     return {"ok": True}
 
 
+# ---- Admin endpoints (key management)
+
+@app.post("/v1/admin/keys")
+def create_key(
+    request: CreateKeyRequest,
+    x_m87_key: Optional[str] = Header(None, alias="X-M87-Key"),
+):
+    """Create a new API key. Requires admin:keys scope."""
+    verify_auth(x_m87_key, "admin:keys")
+
+    plaintext, record = key_store.create_key(
+        principal_type=request.principal_type,
+        principal_id=request.principal_id,
+        endpoint_scopes=set(request.endpoint_scopes),
+        effect_scopes=set(request.effect_scopes) if request.effect_scopes else set(),
+        max_risk=request.max_risk,
+        description=request.description,
+    )
+
+    logger.info(f"Key created: {record.key_id} for {record.principal_type}:{record.principal_id}")
+
+    return {
+        "key_id": record.key_id,
+        "key": plaintext,  # Only returned once at creation
+        "principal_type": record.principal_type,
+        "principal_id": record.principal_id,
+        "endpoint_scopes": sorted(record.endpoint_scopes),
+        "effect_scopes": sorted(record.effect_scopes),
+        "max_risk": record.max_risk,
+    }
+
+
+@app.get("/v1/admin/keys")
+def list_keys(x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
+    """List all API keys. Requires admin:keys scope."""
+    verify_auth(x_m87_key, "admin:keys")
+
+    keys = key_store.list_keys()
+    return {
+        "keys": [
+            {
+                "key_id": k.key_id,
+                "principal_type": k.principal_type,
+                "principal_id": k.principal_id,
+                "endpoint_scopes": sorted(k.endpoint_scopes),
+                "effect_scopes": sorted(k.effect_scopes),
+                "max_risk": k.max_risk,
+                "enabled": k.enabled,
+                "created_at": k.created_at.isoformat() if k.created_at else None,
+                "description": k.description,
+            }
+            for k in keys
+        ]
+    }
+
+
+@app.post("/v1/admin/keys/{key_id}/disable")
+def disable_key(key_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
+    """Disable an API key. Requires admin:keys scope."""
+    verify_auth(x_m87_key, "admin:keys")
+
+    if key_store.disable_key(key_id):
+        logger.info(f"Key disabled: {key_id}")
+        return {"disabled": True, "key_id": key_id}
+    raise HTTPException(status_code=404, detail="Key not found")
+
+
+@app.post("/v1/admin/keys/{key_id}/enable")
+def enable_key(key_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
+    """Enable an API key. Requires admin:keys scope."""
+    verify_auth(x_m87_key, "admin:keys")
+
+    if key_store.enable_key(key_id):
+        logger.info(f"Key enabled: {key_id}")
+        return {"enabled": True, "key_id": key_id}
+    raise HTTPException(status_code=404, detail="Key not found")
+
+
+@app.delete("/v1/admin/keys/{key_id}")
+def delete_key(key_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
+    """Delete an API key. Requires admin:keys scope."""
+    verify_auth(x_m87_key, "admin:keys")
+
+    if key_id == "key_bootstrap":
+        raise HTTPException(status_code=400, detail="Cannot delete bootstrap key")
+
+    if key_store.delete_key(key_id):
+        logger.info(f"Key deleted: {key_id}")
+        return {"deleted": True, "key_id": key_id}
+    raise HTTPException(status_code=404, detail="Key not found")
+
+
 @app.post("/v1/admin/emit")
 def admin_emit(payload: Dict[str, Any], x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
     """Admin endpoint to emit arbitrary events (for testing)."""
     if not ENABLE_TEST_ENDPOINTS:
         raise HTTPException(status_code=404, detail="Not found")
 
-    verify_api_key(x_m87_key)
+    verify_auth(x_m87_key, "admin:emit")
 
     event_type = payload.get("type")
     data = payload.get("payload", {})
