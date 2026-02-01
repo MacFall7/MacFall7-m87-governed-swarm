@@ -1,6 +1,22 @@
 version: "3.8"
 
 services:
+  # ---- Phase 2: Postgres as system of record ----
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=m87
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-m87-dev-password}
+      - POSTGRES_DB=m87_governance
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U m87 -d m87_governance"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -29,11 +45,14 @@ services:
       - "8000:8000"
     environment:
       - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://m87:${POSTGRES_PASSWORD:-m87-dev-password}@postgres:5432/m87_governance
       - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       - M87_ENABLE_TEST_ENDPOINTS=${M87_ENABLE_TEST_ENDPOINTS:-false}
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
@@ -140,3 +159,4 @@ services:
 
 volumes:
   redis_data:
+  postgres_data:

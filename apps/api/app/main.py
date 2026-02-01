@@ -6,6 +6,7 @@ import os
 import json
 import uuid
 import logging
+from datetime import datetime
 from redis import Redis
 
 from .auth import (
@@ -16,17 +17,34 @@ from .auth import (
     emit_auth_event,
 )
 
+from .db import (
+    init_db,
+    check_db_health,
+    PersistenceUnavailable,
+    persist_api_key,
+    persist_proposal,
+    persist_decision,
+    persist_job,
+    persist_execution,
+    update_api_key_enabled,
+    delete_api_key as db_delete_key,
+)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="m87-governed-swarm-api", version="0.2.0")
+app = FastAPI(title="m87-governed-swarm-api", version="0.3.0")
 
 # ---- Config
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 BOOTSTRAP_KEY = os.getenv("M87_API_KEY", "m87-dev-key-change-me")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
 ENABLE_TEST_ENDPOINTS = os.getenv("M87_ENABLE_TEST_ENDPOINTS", "false").lower() == "true"
+
+# ---- Global state: persistence availability
+_db_available = False
 
 # CORS - tightened for V1.2
 app.add_middleware(
@@ -93,11 +111,12 @@ def emit(event_type: str, payload: Dict[str, Any]) -> str:
     return event_id
 
 
-# ---- Startup: Seed bootstrap key
+# ---- Startup: Initialize database and seed bootstrap key
 @app.on_event("startup")
 async def startup_event():
     """Initialize the system on startup."""
-    logger.info("M87 API starting up...")
+    global _db_available
+    logger.info("M87 API starting up (v0.3.0 - Postgres persistence)...")
 
     # Check Redis connection
     try:
@@ -107,15 +126,72 @@ async def startup_event():
         logger.error(f"Redis connection failed: {e}")
         raise
 
+    # Initialize database (Phase 2)
+    if DATABASE_URL:
+        try:
+            if init_db():
+                _db_available = True
+                logger.info("Postgres connection OK - tables initialized")
+
+                # Verify connectivity
+                health = check_db_health()
+                if not health["connected"]:
+                    logger.error(f"Postgres health check failed: {health['error']}")
+                    _db_available = False
+            else:
+                logger.error("Failed to initialize database tables")
+                _db_available = False
+        except Exception as e:
+            logger.error(f"Postgres initialization failed: {e}")
+            _db_available = False
+    else:
+        logger.warning("DATABASE_URL not configured - running without persistence")
+        _db_available = False
+
     # Seed bootstrap key if it doesn't exist
     existing = key_store.get_by_plaintext(BOOTSTRAP_KEY)
     if not existing:
         record = key_store.seed_bootstrap_key(BOOTSTRAP_KEY)
         logger.info(f"Bootstrap key seeded: {record.key_id}")
+
+        # Persist bootstrap key to Postgres if available
+        if _db_available:
+            try:
+                persist_api_key(
+                    key_id=record.key_id,
+                    key_hash=record.key_hash,
+                    principal_type=record.principal_type,
+                    principal_id=record.principal_id,
+                    endpoint_scopes=list(record.endpoint_scopes),
+                    effect_scopes=list(record.effect_scopes),
+                    max_risk=record.max_risk,
+                    enabled=record.enabled,
+                    description=record.description,
+                )
+            except Exception as e:
+                logger.error(f"Failed to persist bootstrap key: {e}")
     else:
         logger.info(f"Bootstrap key already exists: {existing.key_id}")
 
-    logger.info("M87 API ready")
+    logger.info(f"M87 API ready (db_available={_db_available})")
+
+
+# ---- Hard fail-safe helper (Phase 2)
+def require_persistence():
+    """
+    Hard fail-safe: deny mutations if Postgres is unavailable.
+
+    Raises HTTPException 503 if persistence is not available.
+    """
+    if not _db_available:
+        logger.warning("Mutation denied: persistence unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "DB_UNAVAILABLE",
+                "message": "Persistence layer unavailable - mutations denied",
+            }
+        )
 
 
 # ---- Auth helper
@@ -225,19 +301,43 @@ def enqueue_job(proposal_id: str, tool: str, inputs: Dict[str, Any] = None) -> s
     """
     Mint a JobSpec and add to jobs stream.
     This is the ONLY way jobs get created - after governance.
+
+    V0.3.0: Persists job to Postgres (write-through).
     """
     if tool not in ALLOWED_TOOLS:
         raise ValueError(f"Tool '{tool}' not in allowlist: {ALLOWED_TOOLS}")
 
     job_id = str(uuid.uuid4())
+    sandbox = {"network": "deny", "fs": "ro"}
+    timeout_seconds = 60
+    job_inputs = inputs or {}
+
     job = {
         "job_id": job_id,
         "proposal_id": proposal_id,
         "tool": tool,
-        "inputs": inputs or {},
-        "sandbox": {"network": "deny", "fs": "ro"},
-        "timeout_seconds": 60,
+        "inputs": job_inputs,
+        "sandbox": sandbox,
+        "timeout_seconds": timeout_seconds,
     }
+
+    # Phase 2: Persist job to Postgres (write-through)
+    if _db_available:
+        try:
+            persist_job(
+                job_id=job_id,
+                proposal_id=proposal_id,
+                tool=tool,
+                inputs=job_inputs,
+                sandbox=sandbox,
+                timeout_seconds=timeout_seconds,
+            )
+        except PersistenceUnavailable as e:
+            logger.error(f"Failed to persist job: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "DB_WRITE_FAILED", "message": str(e)}
+            )
 
     rdb.xadd(JOB_STREAM, {"job": json.dumps(job)})
     emit("job.created", {"job_id": job_id, "proposal_id": proposal_id, "tool": tool})
@@ -272,11 +372,31 @@ def check_agent_risk(agent: str, risk_score: Optional[float]) -> tuple[bool, flo
 
 @app.get("/health")
 def health():
+    """
+    Health check endpoint.
+
+    Returns health status for Redis and Postgres.
+    System is "ok" only if all required services are available.
+    """
+    redis_ok = False
     try:
         rdb.ping()
-        return {"ok": True, "redis": "connected", "version": "0.2.0"}
+        redis_ok = True
     except Exception:
-        return {"ok": False, "redis": "disconnected"}
+        pass
+
+    db_health = check_db_health() if DATABASE_URL else {"connected": False, "error": "Not configured"}
+
+    # System is healthy if Redis is up and (DB is up or not configured)
+    system_ok = redis_ok and (db_health["connected"] or not DATABASE_URL)
+
+    return {
+        "ok": system_ok,
+        "version": "0.3.0",
+        "redis": "connected" if redis_ok else "disconnected",
+        "postgres": "connected" if db_health["connected"] else "disconnected",
+        "persistence_available": _db_available,
+    }
 
 
 @app.get("/v1/agents")
@@ -320,7 +440,12 @@ def govern_proposal(
     3. Agent risk threshold exceeded → REQUIRE_HUMAN
     4. DEPLOY → REQUIRE_HUMAN
     5. Otherwise → ALLOW
+
+    V0.3.0: Requires Postgres for write-through (hard fail-safe).
     """
+    # Phase 2: Hard fail-safe - require persistence for mutations
+    require_persistence()
+
     # V2.0: Scoped auth check
     auth = verify_auth(
         x_m87_key=x_m87_key,
@@ -328,6 +453,27 @@ def govern_proposal(
         requested_effects=set(proposal.effects),
         risk_score=proposal.risk_score,
     )
+
+    # Phase 2: Persist proposal to Postgres (write-through)
+    try:
+        persist_proposal(
+            proposal_id=proposal.proposal_id,
+            intent_id=proposal.intent_id,
+            agent=proposal.agent,
+            summary=proposal.summary,
+            effects=list(proposal.effects),
+            artifacts=proposal.artifacts,
+            truth_account=proposal.truth_account.model_dump() if proposal.truth_account else None,
+            risk_score=proposal.risk_score,
+            principal_type=auth.principal_type,
+            principal_id=auth.principal_id,
+        )
+    except PersistenceUnavailable as e:
+        logger.error(f"Failed to persist proposal: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "DB_WRITE_FAILED", "message": str(e)}
+        )
 
     reasons: List[str] = []
     agent = proposal.agent
@@ -339,6 +485,13 @@ def govern_proposal(
             proposal_id=proposal.proposal_id,
             decision="DENY",
             reasons=reasons,
+        )
+        # Phase 2: Persist decision
+        persist_decision(
+            proposal_id=proposal.proposal_id,
+            outcome="DENY",
+            reasons=reasons,
+            decided_by="policy",
         )
         emit("proposal.denied", {
             **decision.model_dump(),
@@ -355,6 +508,13 @@ def govern_proposal(
             proposal_id=proposal.proposal_id,
             decision="DENY",
             reasons=reasons,
+        )
+        # Phase 2: Persist decision
+        persist_decision(
+            proposal_id=proposal.proposal_id,
+            outcome="DENY",
+            reasons=reasons,
+            decided_by="policy",
         )
         emit("proposal.denied", {
             **decision.model_dump(),
@@ -374,6 +534,15 @@ def govern_proposal(
             required_approvals=["mac"],
             allowed_effects=proposal.effects,
         )
+        # Phase 2: Persist decision
+        persist_decision(
+            proposal_id=proposal.proposal_id,
+            outcome="REQUIRE_HUMAN",
+            reasons=reasons,
+            decided_by="policy",
+            required_approvals=["mac"],
+            allowed_effects=list(proposal.effects),
+        )
         emit("proposal.needs_approval", {
             **decision.model_dump(),
             "summary": proposal.summary,
@@ -390,12 +559,22 @@ def govern_proposal(
     # Rule 4: DEPLOY requires human approval
     if "DEPLOY" in proposal.effects:
         reasons.append("DEPLOY requires human approval.")
+        allowed = [e for e in proposal.effects if e != "DEPLOY"]
         decision = GovernanceDecision(
             proposal_id=proposal.proposal_id,
             decision="REQUIRE_HUMAN",
             reasons=reasons,
             required_approvals=["mac"],
-            allowed_effects=[e for e in proposal.effects if e != "DEPLOY"],
+            allowed_effects=allowed,
+        )
+        # Phase 2: Persist decision
+        persist_decision(
+            proposal_id=proposal.proposal_id,
+            outcome="REQUIRE_HUMAN",
+            reasons=reasons,
+            decided_by="policy",
+            required_approvals=["mac"],
+            allowed_effects=allowed,
         )
         emit("proposal.needs_approval", {
             **decision.model_dump(),
@@ -417,6 +596,14 @@ def govern_proposal(
         reasons=reasons,
         allowed_effects=proposal.effects,
     )
+    # Phase 2: Persist decision
+    persist_decision(
+        proposal_id=proposal.proposal_id,
+        outcome="ALLOW",
+        reasons=reasons,
+        decided_by="policy",
+        allowed_effects=list(proposal.effects),
+    )
     emit("proposal.allowed", {
         **decision.model_dump(),
         "agent": agent,
@@ -435,6 +622,9 @@ def govern_proposal(
 @app.post("/v1/approve/{proposal_id}")
 def approve(proposal_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
     """Human approves a pending proposal. Requires proposal:approve scope."""
+    # Phase 2: Hard fail-safe
+    require_persistence()
+
     auth = verify_auth(x_m87_key, "proposal:approve")
 
     pending_key = f"m87:pending:{proposal_id}"
@@ -444,6 +634,14 @@ def approve(proposal_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M
         raise HTTPException(status_code=404, detail="No pending proposal found")
 
     proposal_data = json.loads(pending_data.get("proposal", "{}"))
+
+    # Phase 2: Persist human approval decision
+    persist_decision(
+        proposal_id=proposal_id,
+        outcome="ALLOW",
+        reasons=["Human approved"],
+        decided_by=f"human:{auth.principal_id}",
+    )
 
     evt = {
         "proposal_id": proposal_id,
@@ -469,9 +667,20 @@ def deny(
     x_m87_key: Optional[str] = Header(None, alias="X-M87-Key"),
 ):
     """Human denies a pending proposal. Requires proposal:deny scope."""
+    # Phase 2: Hard fail-safe
+    require_persistence()
+
     auth = verify_auth(x_m87_key, "proposal:deny")
 
     pending_key = f"m87:pending:{proposal_id}"
+
+    # Phase 2: Persist human denial decision
+    persist_decision(
+        proposal_id=proposal_id,
+        outcome="DENY",
+        reasons=[reason],
+        decided_by=f"human:{auth.principal_id}",
+    )
 
     evt = {
         "proposal_id": proposal_id,
@@ -576,10 +785,31 @@ def pending_approvals():
 @app.post("/v1/runner/result")
 def runner_result(payload: Dict[str, Any], x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
     """Runner reports job completion/failure. Requires runner:result scope."""
-    verify_auth(x_m87_key, "runner:result")
+    # Phase 2: Hard fail-safe
+    require_persistence()
+
+    auth = verify_auth(x_m87_key, "runner:result")
 
     job_id = payload.get("job_id")
     status = payload.get("status", "completed")
+    output = payload.get("output")
+    error = payload.get("error")
+
+    # Phase 2: Persist execution receipt
+    try:
+        persist_execution(
+            job_id=job_id,
+            status=status,
+            output=output,
+            error=error,
+            runner_id=auth.principal_id,
+        )
+    except PersistenceUnavailable as e:
+        logger.error(f"Failed to persist execution: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "DB_WRITE_FAILED", "message": str(e)}
+        )
 
     if status == "completed":
         emit("job.completed", payload)
@@ -597,6 +827,9 @@ def create_key(
     x_m87_key: Optional[str] = Header(None, alias="X-M87-Key"),
 ):
     """Create a new API key. Requires admin:keys scope."""
+    # Phase 2: Hard fail-safe
+    require_persistence()
+
     verify_auth(x_m87_key, "admin:keys")
 
     plaintext, record = key_store.create_key(
@@ -607,6 +840,29 @@ def create_key(
         max_risk=request.max_risk,
         description=request.description,
     )
+
+    # Phase 2: Persist key to Postgres
+    try:
+        persist_api_key(
+            key_id=record.key_id,
+            key_hash=record.key_hash,
+            principal_type=record.principal_type,
+            principal_id=record.principal_id,
+            endpoint_scopes=list(record.endpoint_scopes),
+            effect_scopes=list(record.effect_scopes),
+            max_risk=record.max_risk,
+            enabled=record.enabled,
+            expires_at=record.expires_at,
+            description=record.description,
+        )
+    except PersistenceUnavailable as e:
+        logger.error(f"Failed to persist key: {e}")
+        # Rollback Redis write
+        key_store.delete_key(record.key_id)
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "DB_WRITE_FAILED", "message": str(e)}
+        )
 
     logger.info(f"Key created: {record.key_id} for {record.principal_type}:{record.principal_id}")
 
@@ -648,9 +904,14 @@ def list_keys(x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
 @app.post("/v1/admin/keys/{key_id}/disable")
 def disable_key(key_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
     """Disable an API key. Requires admin:keys scope."""
+    # Phase 2: Hard fail-safe
+    require_persistence()
+
     verify_auth(x_m87_key, "admin:keys")
 
     if key_store.disable_key(key_id):
+        # Phase 2: Persist to Postgres
+        update_api_key_enabled(key_id, False)
         logger.info(f"Key disabled: {key_id}")
         return {"disabled": True, "key_id": key_id}
     raise HTTPException(status_code=404, detail="Key not found")
@@ -659,9 +920,14 @@ def disable_key(key_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M8
 @app.post("/v1/admin/keys/{key_id}/enable")
 def enable_key(key_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
     """Enable an API key. Requires admin:keys scope."""
+    # Phase 2: Hard fail-safe
+    require_persistence()
+
     verify_auth(x_m87_key, "admin:keys")
 
     if key_store.enable_key(key_id):
+        # Phase 2: Persist to Postgres
+        update_api_key_enabled(key_id, True)
         logger.info(f"Key enabled: {key_id}")
         return {"enabled": True, "key_id": key_id}
     raise HTTPException(status_code=404, detail="Key not found")
@@ -670,12 +936,17 @@ def enable_key(key_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M87
 @app.delete("/v1/admin/keys/{key_id}")
 def delete_key(key_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
     """Delete an API key. Requires admin:keys scope."""
+    # Phase 2: Hard fail-safe
+    require_persistence()
+
     verify_auth(x_m87_key, "admin:keys")
 
     if key_id == "key_bootstrap":
         raise HTTPException(status_code=400, detail="Cannot delete bootstrap key")
 
     if key_store.delete_key(key_id):
+        # Phase 2: Persist to Postgres
+        db_delete_key(key_id)
         logger.info(f"Key deleted: {key_id}")
         return {"deleted": True, "key_id": key_id}
     raise HTTPException(status_code=404, detail="Key not found")
