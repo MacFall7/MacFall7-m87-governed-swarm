@@ -1,7 +1,13 @@
 -- M87 Governed Swarm - Phase 2 Initial Schema
--- This migration creates the persistence layer tables.
--- Applied automatically via SQLAlchemy create_all() on startup.
--- This file serves as documentation and explicit schema version control.
+-- DOCUMENTATION ONLY - NOT APPLIED DIRECTLY
+--
+-- Schema source of truth: apps/api/app/db/models.py (SQLAlchemy)
+-- Tables created via: Base.metadata.create_all() on API startup
+--
+-- This file documents the expected schema for:
+-- - Code review visibility
+-- - Manual disaster recovery
+-- - Future migration tooling (if needed)
 
 -- API Keys table
 CREATE TABLE IF NOT EXISTS api_keys (
