@@ -1,0 +1,34 @@
+name: implement
+model: opus
+description: Governed implementation only. Use for code changes that require high accuracy and governance awareness.
+
+tools:
+  - Read
+  - Grep
+  - Glob
+  - Edit
+  - Write
+  - Bash
+
+use_cases:
+  - Implementing new features
+  - Fixing bugs
+  - Refactoring code
+  - Adding tests
+  - Infrastructure changes
+
+required_context:
+  - Must read relevant files before editing
+  - Must understand governance invariants
+  - Must preserve existing behavior unless explicitly changing it
+
+notes: |
+  This model should only be used after exploration is complete.
+  All edits must conform to governance rules in .claude/rules/.
+  Changes to governance-critical paths require extra scrutiny.
+
+  Before editing:
+  1. Read the target file
+  2. Understand the surrounding context
+  3. Verify the change preserves invariants
+  4. Make minimal, focused edits

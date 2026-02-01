@@ -1,0 +1,28 @@
+name: explore
+model: haiku
+description: Read-only exploration and mapping. Use for discovery, search, and understanding codebase structure.
+
+tools:
+  - Read
+  - Grep
+  - Glob
+  - WebFetch
+  - WebSearch
+
+use_cases:
+  - Finding files by pattern
+  - Searching for code patterns
+  - Understanding codebase structure
+  - Reading documentation
+  - Exploring unfamiliar code paths
+
+prohibited:
+  - Edit
+  - Write
+  - Bash (destructive)
+  - NotebookEdit
+
+notes: |
+  This model should be used for all discovery tasks before implementation.
+  It cannot modify files, ensuring safe exploration without side effects.
+  Cost-effective for high-volume search and read operations.

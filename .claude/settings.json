@@ -1,0 +1,55 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -m py_compile $(find apps services packages -name '*.py' 2>/dev/null | head -20) 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '[pre-bash] Checking system state...' && test -f scripts/status.sh && ./scripts/status.sh 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit(apps/**)",
+      "Edit(services/**)",
+      "Edit(packages/**)",
+      "Edit(infra/**)",
+      "Edit(scripts/**)",
+      "Write(apps/**)",
+      "Write(services/**)",
+      "Write(packages/**)",
+      "Write(infra/**)",
+      "Write(scripts/**)",
+      "Bash(python3 *)",
+      "Bash(git *)",
+      "Bash(docker *)",
+      "Bash(curl *)",
+      "Bash(mkdir *)",
+      "Bash(ls *)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(sudo *)",
+      "Write(.env)",
+      "Edit(.env)"
+    ]
+  }
+}
