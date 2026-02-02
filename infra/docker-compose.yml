@@ -50,6 +50,7 @@ services:
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       - M87_ENABLE_TEST_ENDPOINTS=${M87_ENABLE_TEST_ENDPOINTS:-false}
       - M87_TOOL_MANIFEST_PATH=/app/tool_manifest.json
+      - M87_MANIFEST_LOCK_PATH=/app/manifest.lock.json
       - M87_MAX_RUNNER_RESULT_BYTES=${M87_MAX_RUNNER_RESULT_BYTES:-65536}
     depends_on:
       redis:
@@ -72,6 +73,7 @@ services:
       - API_BASE=http://api:8000
       - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
       - M87_TOOL_MANIFEST_PATH=app/tool_manifest.json
+      - M87_MANIFEST_LOCK_PATH=manifest.lock.json
       - M87_MAX_RUNNER_RESULT_BYTES=${M87_MAX_RUNNER_RESULT_BYTES:-65536}
     depends_on:
       api:

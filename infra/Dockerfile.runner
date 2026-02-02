@@ -5,4 +5,8 @@ COPY services/runner/requirements.txt /runner/requirements.txt
 RUN pip install --no-cache-dir -r /runner/requirements.txt
 
 COPY services/runner/app /runner/app
+
+# Supply-chain integrity: include the manifest lock
+COPY manifest.lock.json /runner/manifest.lock.json
+
 CMD ["python", "-u", "app/runner.py"]

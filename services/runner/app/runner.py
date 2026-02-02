@@ -23,6 +23,7 @@ CONSUMER_GROUP = "runner"
 CONSUMER_NAME = os.getenv("RUNNER_NAME", "runner-1")
 
 MANIFEST_PATH = os.getenv("M87_TOOL_MANIFEST_PATH", "app/tool_manifest.json")
+MANIFEST_LOCK_PATH = os.getenv("M87_MANIFEST_LOCK_PATH", "manifest.lock.json")
 
 # Phase 5 Step 3: Result payload cap
 MAX_REPORT_BYTES = int(os.getenv("M87_MAX_RUNNER_RESULT_BYTES", "65536"))
@@ -39,6 +40,45 @@ def load_manifest(path: str) -> Dict[str, Any]:
     data = json.loads(raw.decode("utf-8"))
     data["_manifest_hash"] = hashlib.sha256(raw).hexdigest()
     return data
+
+
+def verify_manifest_lock(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Verify that loaded manifest matches manifest.lock.json.
+    Returns verification result dict.
+    """
+    import os.path
+    if not os.path.exists(MANIFEST_LOCK_PATH):
+        return {"ok": False, "error": f"Lock file not found: {MANIFEST_LOCK_PATH}", "critical": False}
+
+    try:
+        with open(MANIFEST_LOCK_PATH, "r") as f:
+            lock_data = json.load(f)
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to parse lock file: {e}", "critical": True}
+
+    locked_hash = lock_data.get("sha256")
+    if not locked_hash:
+        return {"ok": False, "error": "Lock file missing sha256 field", "critical": True}
+
+    current_hash = manifest.get("_manifest_hash")
+
+    if current_hash != locked_hash:
+        return {
+            "ok": False,
+            "error": "MANIFEST_HASH_DRIFT",
+            "detail": f"Lock expects {locked_hash[:16]}... but manifest is {current_hash[:16]}...",
+            "locked_hash": locked_hash,
+            "current_hash": current_hash,
+            "critical": True,
+        }
+
+    return {
+        "ok": True,
+        "locked_hash": locked_hash,
+        "manifest_version": lock_data.get("manifest_version"),
+        "source_commit": lock_data.get("source_commit"),
+    }
 
 
 def validate_job_against_manifest(job: Dict[str, Any], manifest: Dict[str, Any]) -> Optional[str]:
@@ -191,7 +231,7 @@ def ensure_group(r: Redis) -> None:
 
 
 def main() -> None:
-    print("🏃 M87 Runner V1.4 (Phase 5: Manifest + Timeouts) starting...", flush=True)
+    print("🏃 M87 Runner V1.5 (Manifest Lock Verification) starting...", flush=True)
 
     r = Redis.from_url(REDIS_URL, decode_responses=True)
     ensure_group(r)
@@ -200,6 +240,17 @@ def main() -> None:
     print(f"✓ Loaded manifest v{manifest.get('version', 'unknown')}", flush=True)
     print(f"   Hash: {manifest.get('_manifest_hash', 'unknown')[:16]}...", flush=True)
     print(f"   Tools: {list(manifest.get('tools', {}).keys())}", flush=True)
+
+    # Verify manifest lock (supply-chain integrity)
+    lock_result = verify_manifest_lock(manifest)
+    if lock_result.get("ok"):
+        print(f"✓ Manifest lock verified (commit: {lock_result.get('source_commit', 'unknown')})", flush=True)
+    elif lock_result.get("critical"):
+        print(f"✗ CRITICAL: Manifest lock verification failed: {lock_result.get('error')}", flush=True)
+        print(f"   {lock_result.get('detail', '')}", flush=True)
+        raise RuntimeError(f"Manifest lock verification failed: {lock_result.get('error')}")
+    else:
+        print(f"⚠ Manifest lock not enforced: {lock_result.get('error')}", flush=True)
 
     while True:
         try:

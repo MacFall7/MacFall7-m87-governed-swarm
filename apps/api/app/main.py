@@ -72,6 +72,53 @@ def current_manifest_hash_or_die() -> str:
     return loaded["manifest_hash"]
 
 
+# ---- Manifest lock verification (supply-chain integrity)
+MANIFEST_LOCK_PATH = os.getenv("M87_MANIFEST_LOCK_PATH", "/app/manifest.lock.json")
+
+
+def verify_manifest_lock() -> Dict[str, Any]:
+    """
+    Verify that tool_manifest.json matches manifest.lock.json.
+    Returns verification result dict. Raises on critical mismatch.
+    """
+    lock_path = Path(MANIFEST_LOCK_PATH)
+    if not lock_path.exists():
+        return {"ok": False, "error": f"Lock file not found: {MANIFEST_LOCK_PATH}", "critical": False}
+
+    try:
+        lock_data = json.loads(lock_path.read_text())
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to parse lock file: {e}", "critical": True}
+
+    locked_hash = lock_data.get("sha256")
+    if not locked_hash:
+        return {"ok": False, "error": "Lock file missing sha256 field", "critical": True}
+
+    # Load and hash the manifest
+    manifest_result = load_tool_manifest()
+    if not manifest_result.get("ok"):
+        return {"ok": False, "error": f"Manifest load failed: {manifest_result.get('error')}", "critical": True}
+
+    current_hash = manifest_result["manifest_hash"]
+
+    if current_hash != locked_hash:
+        return {
+            "ok": False,
+            "error": "MANIFEST_HASH_DRIFT",
+            "detail": f"Lock expects {locked_hash[:16]}... but manifest is {current_hash[:16]}...",
+            "locked_hash": locked_hash,
+            "current_hash": current_hash,
+            "critical": True,
+        }
+
+    return {
+        "ok": True,
+        "locked_hash": locked_hash,
+        "manifest_version": lock_data.get("manifest_version"),
+        "source_commit": lock_data.get("source_commit"),
+    }
+
+
 # ---- Phase 5 Step 3: Runner result caps + redaction
 MAX_RUNNER_RESULT_BYTES = int(os.getenv("M87_MAX_RUNNER_RESULT_BYTES", "65536"))  # 64 KiB
 MAX_RUNNER_TEXT_FIELD = int(os.getenv("M87_MAX_RUNNER_TEXT_FIELD", "8000"))       # per string field
@@ -198,7 +245,17 @@ def emit(event_type: str, payload: Dict[str, Any]) -> str:
 async def startup_event():
     """Initialize the system on startup."""
     global _db_available
-    logger.info("M87 API starting up (v0.3.0 - Postgres persistence)...")
+    logger.info("M87 API starting up (v0.4.0 - Manifest lock verification)...")
+
+    # Verify manifest lock (supply-chain integrity)
+    lock_result = verify_manifest_lock()
+    if lock_result.get("ok"):
+        logger.info(f"Manifest lock verified: {lock_result.get('locked_hash', '')[:16]}... (commit: {lock_result.get('source_commit', 'unknown')})")
+    elif lock_result.get("critical"):
+        logger.error(f"CRITICAL: Manifest lock verification failed: {lock_result.get('error')} - {lock_result.get('detail', '')}")
+        raise RuntimeError(f"Manifest lock verification failed: {lock_result.get('error')}")
+    else:
+        logger.warning(f"Manifest lock not enforced: {lock_result.get('error')}")
 
     # Check Redis connection
     try:
