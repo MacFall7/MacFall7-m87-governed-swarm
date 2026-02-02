@@ -7,6 +7,7 @@ import json
 import uuid
 import logging
 import hashlib
+import re
 from pathlib import Path
 from datetime import datetime
 from redis import Redis
@@ -69,6 +70,59 @@ def current_manifest_hash_or_die() -> str:
     if not loaded.get("ok"):
         raise HTTPException(status_code=500, detail=loaded.get("error"))
     return loaded["manifest_hash"]
+
+
+# ---- Phase 5 Step 3: Runner result caps + redaction
+MAX_RUNNER_RESULT_BYTES = int(os.getenv("M87_MAX_RUNNER_RESULT_BYTES", "65536"))  # 64 KiB
+MAX_RUNNER_TEXT_FIELD = int(os.getenv("M87_MAX_RUNNER_TEXT_FIELD", "8000"))       # per string field
+
+_SECRET_PATTERNS = [
+    # PEM blocks
+    re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----.*?-----END [A-Z ]+PRIVATE KEY-----", re.DOTALL),
+    # Common token-ish env assignments
+    re.compile(r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*([^\s\"']+)", re.DOTALL),
+    # AWS Access Key ID (heuristic)
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    # Generic long token blobs (heuristic)
+    re.compile(r"\b[a-zA-Z0-9_\-]{32,}\b"),
+]
+
+
+def _truncate(s: str, limit: int = MAX_RUNNER_TEXT_FIELD) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    return s if len(s) <= limit else (s[:limit] + "…(truncated)")
+
+
+def _redact_text(s: str) -> str:
+    if not s:
+        return s
+    out = s
+    for pat in _SECRET_PATTERNS:
+        out = pat.sub("[REDACTED]", out)
+    return out
+
+
+def sanitize_output(obj: Any) -> Any:
+    """
+    Recursively redact + truncate strings inside runner output payloads.
+    Keeps dict/list structure, only mutates string leaves.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        return _redact_text(_truncate(obj))
+    if isinstance(obj, (int, float, bool)):
+        return obj
+    if isinstance(obj, list):
+        return [sanitize_output(x) for x in obj[:200]]  # cap list length
+    if isinstance(obj, dict):
+        # cap number of keys to prevent payload bombs
+        items = list(obj.items())[:200]
+        return {str(k)[:128]: sanitize_output(v) for k, v in items}
+    # fallback: stringify unknowns
+    return _redact_text(_truncate(str(obj)))
 
 
 # ---- Global state: persistence availability
@@ -313,6 +367,19 @@ class JobSpec(BaseModel):
     inputs: Dict[str, Any] = {}
     sandbox: Dict[str, str] = {"network": "deny", "fs": "ro"}
     timeout_seconds: int = 60
+
+
+# Phase 5 Step 3: Strict runner result contract
+RunnerStatus = Literal["completed", "failed", "manifest_reject"]
+
+
+class RunnerResult(BaseModel):
+    job_id: str = Field(..., min_length=8, max_length=128)
+    proposal_id: str = Field(..., min_length=1, max_length=128)
+    status: RunnerStatus
+    output: Dict[str, Any] = Field(default_factory=dict)
+    manifest_hash: Optional[str] = Field(None, min_length=64, max_length=64)
+    manifest_version: Optional[str] = Field(None, max_length=32)
 
 
 class CreateKeyRequest(BaseModel):
@@ -850,25 +917,42 @@ def pending_approvals():
 
 
 @app.post("/v1/runner/result")
-def runner_result(payload: Dict[str, Any], x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
-    """Runner reports job completion/failure. Requires runner:result scope."""
+def runner_result(result: RunnerResult, x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
+    """
+    Runner reports job completion/failure.
+    Phase 5 Step 3: Hardened with size caps, redaction, and strict schema.
+    """
     # Phase 2: Hard fail-safe
     require_persistence()
 
     auth = verify_auth(x_m87_key, "runner:result")
 
-    job_id = payload.get("job_id")
-    status = payload.get("status", "completed")
-    output = payload.get("output")
-    error = payload.get("error")
+    # Byte-size hard cap (prevents output-as-exfil / memory bombs)
+    raw_bytes = json.dumps(result.model_dump(), ensure_ascii=False).encode("utf-8")
+    if len(raw_bytes) > MAX_RUNNER_RESULT_BYTES:
+        raise HTTPException(status_code=413, detail=f"Result too large ({len(raw_bytes)} bytes)")
 
-    # Phase 2: Persist execution receipt
+    # Sanitize output before anything else touches it
+    safe_output = sanitize_output(result.output)
+
+    # Build payload with sanitized output
+    payload = {
+        "job_id": result.job_id,
+        "proposal_id": result.proposal_id,
+        "status": result.status,
+        "output": safe_output,
+        "manifest_hash": result.manifest_hash,
+        "manifest_version": result.manifest_version,
+        "received_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+    # Phase 2: Persist execution receipt (with sanitized output)
     try:
         persist_execution(
-            job_id=job_id,
-            status=status,
-            output=output,
-            error=error,
+            job_id=result.job_id,
+            status=result.status,
+            output=safe_output,
+            error=safe_output.get("error") if isinstance(safe_output, dict) else None,
             runner_id=auth.principal_id,
         )
     except PersistenceUnavailable as e:
@@ -878,7 +962,7 @@ def runner_result(payload: Dict[str, Any], x_m87_key: Optional[str] = Header(Non
             detail={"error": "DB_WRITE_FAILED", "message": str(e)}
         )
 
-    if status == "completed":
+    if result.status == "completed":
         emit("job.completed", payload)
     else:
         emit("job.failed", payload)

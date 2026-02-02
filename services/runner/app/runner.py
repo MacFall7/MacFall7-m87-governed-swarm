@@ -24,6 +24,9 @@ CONSUMER_NAME = os.getenv("RUNNER_NAME", "runner-1")
 
 MANIFEST_PATH = os.getenv("M87_TOOL_MANIFEST_PATH", "app/tool_manifest.json")
 
+# Phase 5 Step 3: Result payload cap
+MAX_REPORT_BYTES = int(os.getenv("M87_MAX_RUNNER_RESULT_BYTES", "65536"))
+
 
 def _api_headers() -> Dict[str, str]:
     return {"X-M87-Key": API_KEY, "content-type": "application/json"}
@@ -159,7 +162,7 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
 
 
 def report_result(job_id: str, proposal_id: str, status: str, output: Dict[str, Any], manifest: Dict[str, Any]) -> None:
-    """Report result back to API with manifest metadata."""
+    """Report result back to API with manifest metadata. Phase 5 Step 3: bounded payload."""
     payload = {
         "job_id": job_id,
         "proposal_id": proposal_id,
@@ -168,7 +171,15 @@ def report_result(job_id: str, proposal_id: str, status: str, output: Dict[str, 
         "manifest_hash": manifest.get("_manifest_hash"),
         "manifest_version": manifest.get("version"),
     }
-    requests.post(f"{API_BASE}/v1/runner/result", headers=_api_headers(), data=json.dumps(payload), timeout=20).raise_for_status()
+
+    # Phase 5 Step 3: Enforce byte size cap on outbound results
+    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if len(raw) > MAX_REPORT_BYTES:
+        # Hard truncate output fields locally
+        payload["output"] = {"error": "runner_output_too_large", "bytes": len(raw)}
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    requests.post(f"{API_BASE}/v1/runner/result", headers=_api_headers(), data=raw, timeout=20).raise_for_status()
 
 
 def ensure_group(r: Redis) -> None:
