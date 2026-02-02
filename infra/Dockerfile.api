@@ -5,5 +5,10 @@ COPY apps/api/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY apps/api/app /app/app
+
+# Phase 5: include the runner tool manifest in the API image too
+# so /v1/tools can be a real view of what the runner can execute.
+COPY services/runner/app/tool_manifest.json /app/tool_manifest.json
+
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host=0.0.0.0", "--port=8000"]

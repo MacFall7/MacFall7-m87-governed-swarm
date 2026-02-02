@@ -8,6 +8,7 @@ import os
 import time
 import json
 import subprocess
+import hashlib
 import requests
 from typing import Any, Dict, Optional
 from redis import Redis
@@ -28,9 +29,13 @@ def _api_headers() -> Dict[str, str]:
     return {"X-M87-Key": API_KEY, "content-type": "application/json"}
 
 
-def load_manifest() -> Dict[str, Any]:
-    with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_manifest(path: str) -> Dict[str, Any]:
+    """Load manifest and compute hash for integrity verification."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    data = json.loads(raw.decode("utf-8"))
+    data["_manifest_hash"] = hashlib.sha256(raw).hexdigest()
+    return data
 
 
 def validate_job_against_manifest(job: Dict[str, Any], manifest: Dict[str, Any]) -> Optional[str]:
@@ -80,43 +85,68 @@ def validate_job_against_manifest(job: Dict[str, Any], manifest: Dict[str, Any])
 
 # ---- Tool implementations (the runner is allowed to be boring)
 
-def tool_echo(message: str) -> Dict[str, Any]:
-    completed = subprocess.run(["echo", message], capture_output=True, text=True, check=True)
-    return {"stdout": completed.stdout.strip()}
+def tool_echo(message: str, timeout_seconds: int) -> Dict[str, Any]:
+    """Execute echo command with timeout enforcement."""
+    try:
+        completed = subprocess.run(
+            ["echo", message],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout_seconds
+        )
+        return {"stdout": completed.stdout.strip(), "exit_code": 0}
+    except subprocess.TimeoutExpired:
+        return {"error": "timeout", "exit_code": -1}
 
 
-def tool_pytest(args: str) -> Dict[str, Any]:
+def tool_pytest(args: str, timeout_seconds: int) -> Dict[str, Any]:
+    """Execute pytest with timeout enforcement."""
     # Keep it safe: don't allow shell=True, no arbitrary command expansion
     # args is passed as tokens after splitting on spaces
     cmd = ["pytest"] + ([a for a in args.split(" ") if a] if args else [])
-    completed = subprocess.run(cmd, capture_output=True, text=True)
-    return {
-        "exit_code": completed.returncode,
-        "stdout": (completed.stdout or "")[-8000:],  # cap output
-        "stderr": (completed.stderr or "")[-8000:]
-    }
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds
+        )
+        return {
+            "exit_code": completed.returncode,
+            "stdout": (completed.stdout or "")[-8000:],  # cap output
+            "stderr": (completed.stderr or "")[-8000:]
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": "timeout", "exit_code": -1, "stdout": "", "stderr": ""}
 
 
-def execute_job(job: Dict[str, Any]) -> Dict[str, Any]:
+def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute job with manifest-defined timeout."""
     tool = job["tool"]
     inputs = job.get("inputs", {})
+    tool_spec = manifest.get("tools", {}).get(tool, {})
+    timeout_seconds = int(tool_spec.get("timeout_seconds", 30))
 
     if tool == "echo":
-        return tool_echo(inputs.get("message", ""))
+        return tool_echo(inputs.get("message", ""), timeout_seconds)
 
     if tool == "pytest":
-        return tool_pytest(inputs.get("args", ""))
+        return tool_pytest(inputs.get("args", ""), timeout_seconds)
 
     # Should never happen due to manifest validation
     raise RuntimeError(f"Unhandled tool: {tool}")
 
 
-def report_result(job_id: str, proposal_id: str, status: str, output: Dict[str, Any]) -> None:
+def report_result(job_id: str, proposal_id: str, status: str, output: Dict[str, Any], manifest: Dict[str, Any]) -> None:
+    """Report result back to API with manifest metadata."""
     payload = {
         "job_id": job_id,
         "proposal_id": proposal_id,
         "status": status,
-        "output": output
+        "output": output,
+        "manifest_hash": manifest.get("_manifest_hash"),
+        "manifest_version": manifest.get("version"),
     }
     requests.post(f"{API_BASE}/v1/runner/result", headers=_api_headers(), data=json.dumps(payload), timeout=20).raise_for_status()
 
@@ -130,13 +160,14 @@ def ensure_group(r: Redis) -> None:
 
 
 def main() -> None:
-    print("🏃 M87 Runner V1.3 (Phase 4: Tool Manifest) starting...", flush=True)
+    print("🏃 M87 Runner V1.4 (Phase 5: Manifest + Timeouts) starting...", flush=True)
 
     r = Redis.from_url(REDIS_URL, decode_responses=True)
     ensure_group(r)
 
-    manifest = load_manifest()
+    manifest = load_manifest(MANIFEST_PATH)
     print(f"✓ Loaded manifest v{manifest.get('version', 'unknown')}", flush=True)
+    print(f"   Hash: {manifest.get('_manifest_hash', 'unknown')[:16]}...", flush=True)
     print(f"   Tools: {list(manifest.get('tools', {}).keys())}", flush=True)
 
     while True:
@@ -170,19 +201,19 @@ def main() -> None:
                     err = validate_job_against_manifest(job, manifest)
                     if err:
                         print(f"  ✗ Manifest reject: {err}", flush=True)
-                        report_result(job_id, proposal_id, "failed", {"error": "manifest_reject", "detail": err})
+                        report_result(job_id, proposal_id, "failed", {"error": "manifest_reject", "detail": err}, manifest)
                         r.xack(JOBS_STREAM, CONSUMER_GROUP, msg_id)
                         continue
 
-                    # Execute
+                    # Execute with manifest-defined timeout
                     try:
-                        output = execute_job(job)
+                        output = execute_job(job, manifest)
                         status = "completed" if output.get("exit_code", 0) == 0 else "failed"
                         print(f"  → {status}", flush=True)
-                        report_result(job_id, proposal_id, status, output)
+                        report_result(job_id, proposal_id, status, output, manifest)
                     except Exception as e:
                         print(f"  ✗ Execution error: {e}", flush=True)
-                        report_result(job_id, proposal_id, "failed", {"error": "execution_error", "detail": str(e)})
+                        report_result(job_id, proposal_id, "failed", {"error": "execution_error", "detail": str(e)}, manifest)
 
                     r.xack(JOBS_STREAM, CONSUMER_GROUP, msg_id)
 

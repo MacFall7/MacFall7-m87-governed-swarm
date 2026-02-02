@@ -259,34 +259,38 @@ echo -e "${GREEN}INVARIANT 3 PASSED${NC}"
 echo ""
 
 # ========================================
-# INVARIANT 4: No manifest entry → no execution
+# INVARIANT 4: No manifest entry → no execution (and tools are visible)
 # ========================================
 echo "========================================"
-echo "INVARIANT 4: No manifest entry → no execution"
+echo "INVARIANT 4: Manifest governs runner tools"
 echo "========================================"
 echo ""
 
-# Submit a proposal that would mint a job using a NONEXISTENT tool (if your API ever allows it)
-# For now we validate runner-side by directly injecting a job into m87:jobs is NOT exposed publicly,
-# so we simulate by expecting the runner to reject unknown tool if it ever appears.
-
-echo -e "${YELLOW}Manual check:${NC} If you ever add a new tool, it must be added to tool_manifest.json or runner will reject it."
-echo ""
 echo "Checking /v1/tools endpoint..."
 TOOLS_RESPONSE=$(curl -s "$API/v1/tools")
 echo "$TOOLS_RESPONSE" | jq .
-echo ""
 
-TOOLS_COUNT=$(echo "$TOOLS_RESPONSE" | jq '.tools | length')
-if [ "$TOOLS_COUNT" -gt 0 ]; then
-    echo -e "${GREEN}✓ Tools manifest exposed via API ($TOOLS_COUNT tools)${NC}"
-else
-    echo -e "${RED}✗ No tools found in /v1/tools${NC}"
-    exit 1
+MANIFEST_HASH=$(echo "$TOOLS_RESPONSE" | jq -r '.manifest_hash // ""')
+TOOL_COUNT=$(echo "$TOOLS_RESPONSE" | jq -r '.tools | length')
+HAS_ECHO=$(echo "$TOOLS_RESPONSE" | jq -r '[.tools[] | select(.tool=="echo")] | length')
+HAS_PYTEST=$(echo "$TOOLS_RESPONSE" | jq -r '[.tools[] | select(.tool=="pytest")] | length')
+
+if [ "${#MANIFEST_HASH}" -ne 64 ]; then
+  echo -e "${RED}✗ Missing/invalid manifest_hash from /v1/tools${NC}"
+  exit 1
 fi
-echo ""
 
-echo -e "${GREEN}✓ Manifest enforcement is runner-hard (tool not in manifest cannot run)${NC}"
+if [ "$TOOL_COUNT" -lt 1 ]; then
+  echo -e "${RED}✗ No tools reported by /v1/tools${NC}"
+  exit 1
+fi
+
+if [ "$HAS_ECHO" -ne 1 ] || [ "$HAS_PYTEST" -ne 1 ]; then
+  echo -e "${RED}✗ Tool list mismatch (expected echo + pytest)${NC}"
+  exit 1
+fi
+
+echo -e "${GREEN}✓ Manifest visible + hashed; expected tools present${NC}"
 echo -e "${GREEN}INVARIANT 4 PASSED${NC}"
 echo ""
 

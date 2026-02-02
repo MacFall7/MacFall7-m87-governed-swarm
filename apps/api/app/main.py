@@ -6,6 +6,8 @@ import os
 import json
 import uuid
 import logging
+import hashlib
+from pathlib import Path
 from datetime import datetime
 from redis import Redis
 
@@ -42,6 +44,24 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 BOOTSTRAP_KEY = os.getenv("M87_API_KEY", "m87-dev-key-change-me")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
 ENABLE_TEST_ENDPOINTS = os.getenv("M87_ENABLE_TEST_ENDPOINTS", "false").lower() == "true"
+
+
+def load_tool_manifest() -> Dict[str, Any]:
+    """Load and hash the tool manifest file."""
+    path = os.getenv("M87_TOOL_MANIFEST_PATH", "")
+    if not path:
+        return {"ok": False, "error": "M87_TOOL_MANIFEST_PATH not set"}
+
+    p = Path(path)
+    if not p.exists():
+        return {"ok": False, "error": f"Manifest not found at {path}"}
+
+    raw = p.read_bytes()
+    manifest_hash = hashlib.sha256(raw).hexdigest()
+    data = json.loads(raw.decode("utf-8"))
+
+    return {"ok": True, "manifest": data, "manifest_hash": manifest_hash, "path": str(p)}
+
 
 # ---- Global state: persistence availability
 _db_available = False
@@ -416,16 +436,34 @@ def list_agents():
 @app.get("/v1/tools")
 def list_tools():
     """
-    Read-only tool manifest view (what the runner can execute).
-    This is informational only; execution still requires job minting.
+    Source-of-truth view of what the runner can execute.
+    Reads the same manifest artifact shipped in the runner container.
     """
-    # Keep it simple for now: mirror the runner manifest conceptually.
-    # Later: load from shared file or Redis.
+    loaded = load_tool_manifest()
+    if not loaded.get("ok"):
+        raise HTTPException(status_code=500, detail=loaded.get("error"))
+
+    manifest = loaded["manifest"]
+    tools = manifest.get("tools", {})
+
+    # Return a minimal, stable shape for dashboard + proof tests
+    view = []
+    for tool_name, spec in tools.items():
+        view.append({
+            "tool": tool_name,
+            "description": spec.get("description", ""),
+            "effects": spec.get("effects", []),
+            "requires_human": spec.get("requires_human", False),
+            "timeout_seconds": spec.get("timeout_seconds", 0),
+        })
+
+    view.sort(key=lambda x: x["tool"])
+
     return {
-        "tools": [
-            {"tool": "echo", "effects": ["SEND_NOTIFICATION"], "requires_human": False},
-            {"tool": "pytest", "effects": ["RUN_TESTS"], "requires_human": False}
-        ]
+        "version": manifest.get("version", ""),
+        "manifest_hash": loaded["manifest_hash"],
+        "path": loaded["path"],
+        "tools": view,
     }
 
 
