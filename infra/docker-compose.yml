@@ -69,6 +69,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - API_BASE=http://api:8000
       - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
+      - M87_TOOL_MANIFEST_PATH=app/tool_manifest.json
     depends_on:
       api:
         condition: service_healthy

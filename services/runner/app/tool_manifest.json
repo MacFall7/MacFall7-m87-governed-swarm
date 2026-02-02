@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "tools": {
+    "echo": {
+      "description": "Safe no-op / heartbeat tool. Echoes a message.",
+      "effects": ["SEND_NOTIFICATION"],
+      "requires_human": false,
+      "inputs": {
+        "required": ["message"],
+        "optional": [],
+        "limits": {
+          "message_max_len": 4000
+        }
+      },
+      "timeout_seconds": 10
+    },
+
+    "pytest": {
+      "description": "Run test suite inside the runner container.",
+      "effects": ["RUN_TESTS"],
+      "requires_human": false,
+      "inputs": {
+        "required": ["args"],
+        "optional": [],
+        "limits": {
+          "args_max_len": 2000
+        }
+      },
+      "timeout_seconds": 300
+    }
+  }
+}

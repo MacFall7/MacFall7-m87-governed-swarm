@@ -413,6 +413,22 @@ def list_agents():
     return {"agents": agents}
 
 
+@app.get("/v1/tools")
+def list_tools():
+    """
+    Read-only tool manifest view (what the runner can execute).
+    This is informational only; execution still requires job minting.
+    """
+    # Keep it simple for now: mirror the runner manifest conceptually.
+    # Later: load from shared file or Redis.
+    return {
+        "tools": [
+            {"tool": "echo", "effects": ["SEND_NOTIFICATION"], "requires_human": False},
+            {"tool": "pytest", "effects": ["RUN_TESTS"], "requires_human": False}
+        ]
+    }
+
+
 @app.post("/v1/intent")
 def create_intent(intent: Intent, _: bool = Header(None, alias="X-M87-Key")):
     emit("intent.created", intent.model_dump(by_alias=True))
