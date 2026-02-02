@@ -122,7 +122,27 @@ def tool_pytest(args: str, timeout_seconds: int) -> Dict[str, Any]:
 
 
 def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]:
-    """Execute job with manifest-defined timeout."""
+    """Execute job with manifest-defined timeout and drift detection."""
+    # Phase 5 Step 2: Manifest hash drift refusal
+    job_hash = job.get("manifest_hash")
+    runner_hash = manifest.get("_manifest_hash")
+
+    if not job_hash:
+        return {
+            "error": "job_missing_manifest_hash",
+            "detail": "Job was minted without manifest_hash (pre-V0.4.0 API?)",
+            "exit_code": -1,
+        }
+
+    if job_hash != runner_hash:
+        return {
+            "error": "manifest_hash_mismatch",
+            "detail": f"Job pinned hash {job_hash[:16]}... but runner has {runner_hash[:16]}...",
+            "job_manifest_hash": job_hash,
+            "runner_manifest_hash": runner_hash,
+            "exit_code": -1,
+        }
+
     tool = job["tool"]
     inputs = job.get("inputs", {})
     tool_spec = manifest.get("tools", {}).get(tool, {})

@@ -63,6 +63,14 @@ def load_tool_manifest() -> Dict[str, Any]:
     return {"ok": True, "manifest": data, "manifest_hash": manifest_hash, "path": str(p)}
 
 
+def current_manifest_hash_or_die() -> str:
+    """Get current manifest hash, or raise 500 if unavailable."""
+    loaded = load_tool_manifest()
+    if not loaded.get("ok"):
+        raise HTTPException(status_code=500, detail=loaded.get("error"))
+    return loaded["manifest_hash"]
+
+
 # ---- Global state: persistence availability
 _db_available = False
 
@@ -323,6 +331,7 @@ def enqueue_job(proposal_id: str, tool: str, inputs: Dict[str, Any] = None) -> s
     This is the ONLY way jobs get created - after governance.
 
     V0.3.0: Persists job to Postgres (write-through).
+    V0.4.0: Pins manifest_hash for drift detection.
     """
     if tool not in ALLOWED_TOOLS:
         raise ValueError(f"Tool '{tool}' not in allowlist: {ALLOWED_TOOLS}")
@@ -332,6 +341,9 @@ def enqueue_job(proposal_id: str, tool: str, inputs: Dict[str, Any] = None) -> s
     timeout_seconds = 60
     job_inputs = inputs or {}
 
+    # Phase 5: Pin manifest hash at job mint time
+    manifest_hash = current_manifest_hash_or_die()
+
     job = {
         "job_id": job_id,
         "proposal_id": proposal_id,
@@ -339,6 +351,7 @@ def enqueue_job(proposal_id: str, tool: str, inputs: Dict[str, Any] = None) -> s
         "inputs": job_inputs,
         "sandbox": sandbox,
         "timeout_seconds": timeout_seconds,
+        "manifest_hash": manifest_hash,
     }
 
     # Phase 2: Persist job to Postgres (write-through)

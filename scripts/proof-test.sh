@@ -1,5 +1,5 @@
 #!/bin/bash
-# M87 V1.3+ Proof Test - Validates the five invariants (Phase 4: Tool Manifest)
+# M87 V1.4+ Proof Test - Validates the six invariants (Phase 5: Manifest Hash Pinning)
 #
 # Usage:
 #   ./scripts/proof-test.sh
@@ -19,7 +19,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 echo "========================================"
-echo "M87 V1.2 PROOF TEST"
+echo "M87 V1.4 PROOF TEST"
 echo "========================================"
 echo ""
 
@@ -295,17 +295,90 @@ echo -e "${GREEN}INVARIANT 4 PASSED${NC}"
 echo ""
 
 # ========================================
+# INVARIANT 5: Jobs pinned with manifest hash (drift detection)
+# ========================================
+echo "========================================"
+echo "INVARIANT 5: Jobs pinned with manifest hash"
+echo "========================================"
+echo ""
+
+# Store manifest hash from API for comparison
+API_MANIFEST_HASH="$MANIFEST_HASH"
+
+echo "Submitting proposal for hash-pinning test..."
+HASH_PROP_ID="p-hash-test-$(date +%s)"
+RESPONSE=$(curl -s -X POST "$API/v1/govern/proposal" \
+  -H "content-type: application/json" \
+  -d "{
+    \"proposal_id\":\"$HASH_PROP_ID\",
+    \"intent_id\":\"i-hash-test\",
+    \"agent\":\"Tester\",
+    \"summary\":\"Test manifest hash pinning\",
+    \"effects\":[\"SEND_NOTIFICATION\"],
+    \"truth_account\":{\"observations\":[\"test\"],\"claims\":[]}
+  }")
+
+DECISION=$(echo "$RESPONSE" | jq -r '.decision')
+if [ "$DECISION" != "ALLOW" ]; then
+    echo -e "${RED}✗ Expected ALLOW for SEND_NOTIFICATION, got: $DECISION${NC}"
+    exit 1
+fi
+
+JOB_ID=$(echo "$RESPONSE" | jq -r '.job_id')
+if [ "$JOB_ID" = "null" ] || [ -z "$JOB_ID" ]; then
+    echo -e "${RED}✗ No job_id returned for auto-approved proposal${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Proposal auto-approved, job: ${JOB_ID:0:8}...${NC}"
+echo ""
+
+echo "Checking job has manifest_hash pinned..."
+sleep 2  # Give runner time to execute
+JOBS=$(curl -s "$API/v1/jobs")
+JOB_MANIFEST_HASH=$(echo "$JOBS" | jq -r ".jobs[] | select(.job_id==\"$JOB_ID\") | .manifest_hash // \"\"")
+
+if [ -z "$JOB_MANIFEST_HASH" ] || [ "$JOB_MANIFEST_HASH" = "null" ]; then
+    echo -e "${RED}✗ Job missing manifest_hash (not pinned at mint time)${NC}"
+    exit 1
+fi
+
+if [ "$JOB_MANIFEST_HASH" != "$API_MANIFEST_HASH" ]; then
+    echo -e "${RED}✗ Job manifest_hash doesn't match API manifest_hash${NC}"
+    echo "  Job hash: $JOB_MANIFEST_HASH"
+    echo "  API hash: $API_MANIFEST_HASH"
+    exit 1
+fi
+
+echo -e "${GREEN}✓ Job manifest_hash matches API manifest (${JOB_MANIFEST_HASH:0:16}...)${NC}"
+echo ""
+
+# Verify job completed (runner accepted matching hash)
+JOB_STATUS=$(echo "$JOBS" | jq -r ".jobs[] | select(.job_id==\"$JOB_ID\") | .status")
+if [ "$JOB_STATUS" = "completed" ]; then
+    echo -e "${GREEN}✓ Job completed (runner accepted matching manifest hash)${NC}"
+elif [ "$JOB_STATUS" = "pending" ] || [ "$JOB_STATUS" = "running" ]; then
+    echo -e "${YELLOW}⏳ Job still $JOB_STATUS (runner may be slow)${NC}"
+else
+    echo -e "${YELLOW}⚠ Job status: $JOB_STATUS${NC}"
+fi
+echo ""
+
+echo -e "${GREEN}INVARIANT 5 PASSED${NC}"
+echo ""
+
+# ========================================
 # SUMMARY
 # ========================================
 echo "========================================"
 echo -e "${GREEN}ALL INVARIANTS PASSED${NC}"
 echo "========================================"
 echo ""
-echo "V1.3+ is locked down:"
+echo "V1.4+ is locked down:"
 echo "  ✓ Invariant 1:  No approval → no job"
 echo "  ✓ Invariant 2:  Approval requires API key (401 without)"
 echo "  ✓ Invariant 3b: Runner ignores events stream"
 echo "  ✓ Invariant 3:  Approval with key → job minted and executed"
 echo "  ✓ Invariant 4:  No manifest entry → no execution"
+echo "  ✓ Invariant 5:  Jobs pinned with manifest hash (drift detection)"
 echo ""
 echo "The system is trustable at 02:00 on your phone."
