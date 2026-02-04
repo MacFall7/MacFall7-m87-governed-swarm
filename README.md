@@ -33,6 +33,8 @@ This repo implements a fail-closed governance perimeter for all executable agent
 - **Artifact-backed completion**: Runner must not report "completed" without verifiable artifacts
 - **Machine-verifiable receipts**: Results include `deh_evidence` (claimed vs recomputed hash + verified flag)
 
+**All enforcement happens in the Runner—the only component authorized to execute tools—so policy can't be bypassed by upstream orchestration.**
+
 ---
 
 ## What This Is

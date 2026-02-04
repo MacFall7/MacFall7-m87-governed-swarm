@@ -348,6 +348,10 @@ Runner results include:
 - `autonomy_budget` + `autonomy_usage`
 - `completion_artifacts` (verifiable hashes)
 
+### Trust Boundary
+
+**All enforcement happens in the Runner—the only component authorized to execute tools—so policy can't be bypassed by upstream orchestration.**
+
 ---
 
 ## Extending the System
