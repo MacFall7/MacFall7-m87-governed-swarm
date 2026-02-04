@@ -1,0 +1,170 @@
+version: "3.9"
+
+# Hardened deployment configuration with runner airgap
+# Use this for production or security-sensitive environments
+
+services:
+  # ---- Phase 2: Postgres as system of record ----
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=m87
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-m87-dev-password}
+      - POSTGRES_DB=m87_governance
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U m87 -d m87_governance"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --auto-aof-rewrite-percentage
+      - "100"
+      - --auto-aof-rewrite-min-size
+      - "64mb"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://m87:${POSTGRES_PASSWORD:-m87-dev-password}@postgres:5432/m87_governance
+      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      - M87_ENABLE_TEST_ENDPOINTS=${M87_ENABLE_TEST_ENDPOINTS:-false}
+      - M87_TOOL_MANIFEST_PATH=/app/tool_manifest.json
+      - M87_MANIFEST_LOCK_PATH=/app/manifest.lock.json
+      - M87_MAX_RUNNER_RESULT_BYTES=${M87_MAX_RUNNER_RESULT_BYTES:-65536}
+      - M87_CHALLENGE_SECRET=${M87_CHALLENGE_SECRET:-change-me-in-production}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - public
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # HARDENED RUNNER: network_mode: none enforces complete airgap
+  # Runner cannot make any outbound network calls
+  # All tool execution is isolated from external networks
+  runner:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.runner
+    network_mode: "none"  # HARD AIRGAP - no network access
+    environment:
+      # Note: With network_mode: none, runner cannot reach redis/api directly
+      # Jobs must be passed via mounted volume or stdin in airgap mode
+      - M87_TOOL_MANIFEST_PATH=app/tool_manifest.json
+      - M87_MANIFEST_LOCK_PATH=manifest.lock.json
+      - M87_MAX_RUNNER_RESULT_BYTES=${M87_MAX_RUNNER_RESULT_BYTES:-65536}
+      - M87_AIRGAP_MODE=true
+    volumes:
+      - runner_jobs:/jobs      # Job queue via filesystem
+      - runner_results:/results # Results via filesystem
+    restart: unless-stopped
+    # Resource limits for defense-in-depth
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Job dispatcher bridges API to airgapped runner via shared volumes
+  job-dispatcher:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    command: ["python", "-m", "app.job_dispatcher"]
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
+      - JOB_QUEUE_PATH=/jobs
+      - RESULT_QUEUE_PATH=/results
+    volumes:
+      - runner_jobs:/jobs
+      - runner_results:/results
+    networks:
+      - internal
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  notifier:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.notifier
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - API_BASE=http://api:8000
+      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
+      - WEBHOOK_URL=${WEBHOOK_URL:-}
+    networks:
+      - internal
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.ui
+    ports:
+      - "3000:3000"
+    networks:
+      - public
+    depends_on:
+      - api
+    restart: unless-stopped
+
+networks:
+  public:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true  # No external access
+
+volumes:
+  redis_data:
+  postgres_data:
+  runner_jobs:
+  runner_results:
