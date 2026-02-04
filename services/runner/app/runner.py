@@ -185,6 +185,41 @@ def scope_rank(scope: str) -> int:
     return {"none": 0, "sandbox": 1, "staging": 2, "prod": 3}.get(scope, 99)
 
 
+# ---- V1 Step 2.7: Centralized network egress (choke point for all external I/O)
+
+def governed_request(
+    tracker: "AutonomyBudgetTracker",
+    method: str,
+    url: str,
+    *,
+    timeout: int = 10,
+    **kwargs: Any,
+) -> requests.Response:
+    """
+    Centralized network egress for tools.
+    Enforces Autonomy Budget max_external_io preemptively.
+
+    All future tools that need network access MUST use this function.
+    This is the single choke point for:
+    - AB external_io enforcement
+    - Runtime budget check
+    - Future: domain allowlist, rate limiting, header stripping, audit logging
+
+    Raises RuntimeError if budget exceeded (caller must handle).
+    """
+    if not tracker.try_external_io():
+        raise RuntimeError("AUTONOMY_BUDGET_EXCEEDED: external_io")
+
+    if tracker.runtime_exceeded():
+        raise RuntimeError("AUTONOMY_BUDGET_EXCEEDED: runtime")
+
+    # Future: domain allowlist check would go here
+    # Future: request/response size caps would go here
+    # Future: audit logging would go here
+
+    return requests.request(method, url, timeout=timeout, **kwargs)
+
+
 # ---- V1 Governance: Autonomy Budget tracking
 class AutonomyBudgetTracker:
     """
