@@ -135,9 +135,62 @@ def enforce_open_weight_safety(envelope: Dict[str, Any]) -> Dict[str, Any]:
     return clamped
 
 
+# ---- V1 Governance: Autonomy Budget helpers
+
+def fail_budget(code: str, detail: str, *, tracker=None, deh_evidence=None) -> Dict[str, Any]:
+    """Standard budget violation response. Ensures consistent shape."""
+    out = {
+        "error": code,
+        "detail": detail,
+        "exit_code": -1,
+    }
+    if tracker:
+        out["autonomy_usage"] = tracker.get_usage()
+    if deh_evidence:
+        out["deh_evidence"] = deh_evidence
+    return out
+
+
+def resolve_autonomy_budget(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Resolve budget from deployment_envelope, with runner defaults.
+    Defense-in-depth: missing budget = runner defaults, not infinite.
+    """
+    env = job.get("deployment_envelope") or {}
+    budget = env.get("autonomy_budget") or {}
+    # Runner defaults (fail-closed)
+    return {
+        "max_steps": int(budget.get("max_steps", 100)),
+        "max_tool_calls": int(budget.get("max_tool_calls", 50)),
+        "max_parallel_agents": int(budget.get("max_parallel_agents", 1)),
+        "max_runtime_seconds": int(budget.get("max_runtime_seconds", 300)),
+        "max_external_io": int(budget.get("max_external_io", 10)),
+        "max_write_scope": budget.get("max_write_scope", "sandbox"),
+    }
+
+
+# Tool write scope requirements - tools declare their blast radius
+TOOL_WRITE_SCOPE_REQUIREMENTS = {
+    "echo": "none",           # Pure output, no writes
+    "pytest": "sandbox",      # May write temp files/logs
+    # Future tools:
+    # "git_push": "prod",
+    # "db_migrate": "prod",
+    # "deploy": "prod",
+}
+
+
+def scope_rank(scope: str) -> int:
+    """Rank write scopes from least to most permissive."""
+    return {"none": 0, "sandbox": 1, "staging": 2, "prod": 3}.get(scope, 99)
+
+
 # ---- V1 Governance: Autonomy Budget tracking
 class AutonomyBudgetTracker:
-    """Tracks resource usage against autonomy budget limits."""
+    """
+    Tracks resource usage against autonomy budget limits.
+    Preemptive enforcement: try_* methods increment only if allowed.
+    """
 
     def __init__(self, budget: Dict[str, Any]):
         self.budget = budget
@@ -146,6 +199,32 @@ class AutonomyBudgetTracker:
         self.parallel_agents = 0
         self.external_io = 0
         self.start_time = time.time()
+
+    def runtime_exceeded(self) -> bool:
+        """Check if runtime limit exceeded."""
+        elapsed = time.time() - self.start_time
+        return elapsed >= self.budget.get("max_runtime_seconds", 300)
+
+    def try_step(self) -> bool:
+        """Try to increment step counter. Returns True if allowed, False if exceeded."""
+        if self.steps >= self.budget.get("max_steps", 100):
+            return False
+        self.steps += 1
+        return True
+
+    def try_tool_call(self) -> bool:
+        """Try to increment tool call counter. Returns True if allowed, False if exceeded."""
+        if self.tool_calls >= self.budget.get("max_tool_calls", 50):
+            return False
+        self.tool_calls += 1
+        return True
+
+    def try_external_io(self) -> bool:
+        """Try to increment external I/O counter. Returns True if allowed, False if exceeded."""
+        if self.external_io >= self.budget.get("max_external_io", 10):
+            return False
+        self.external_io += 1
+        return True
 
     def check_limits(self) -> Optional[str]:
         """Check if any limit is exceeded. Returns error string or None."""
@@ -164,15 +243,6 @@ class AutonomyBudgetTracker:
             return f"AUTONOMY_BUDGET_EXCEEDED: external_io ({self.external_io})"
 
         return None
-
-    def increment_step(self):
-        self.steps += 1
-
-    def increment_tool_call(self):
-        self.tool_calls += 1
-
-    def increment_external_io(self):
-        self.external_io += 1
 
     def get_usage(self) -> Dict[str, Any]:
         return {
@@ -416,41 +486,62 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
     # V1 Governance: Defense-in-depth open-weight clamping
     envelope = job.get("deployment_envelope", {})
     clamped_envelope = enforce_open_weight_safety(envelope)
-    budget = clamped_envelope.get("autonomy_budget", {})
 
-    # V1 Governance: Initialize autonomy budget tracker with clamped values
+    # V1 Step 2: Resolve budget (envelope-first, runner defaults second)
+    budget = resolve_autonomy_budget({"deployment_envelope": clamped_envelope})
     tracker = AutonomyBudgetTracker(budget)
 
-    # Check budget BEFORE execution (pre-call check)
-    budget_error = tracker.check_limits()
-    if budget_error:
-        return {
-            "error": "autonomy_budget_exceeded",
-            "detail": budget_error,
-            "usage": tracker.get_usage(),
-            "deh_evidence": deh_evidence,
-            "exit_code": -1,
-        }
+    # Preemptive AB: runtime check immediately after DEH
+    if tracker.runtime_exceeded():
+        return fail_budget(
+            "autonomy_budget_exceeded",
+            "max_runtime_seconds exceeded at job start",
+            tracker=tracker,
+            deh_evidence=deh_evidence,
+        )
 
     tool = job["tool"]
     inputs = job.get("inputs", {})
     tool_spec = manifest.get("tools", {}).get(tool, {})
     timeout_seconds = int(tool_spec.get("timeout_seconds", 30))
 
-    # Track tool call BEFORE execution
-    tracker.increment_tool_call()
-    tracker.increment_step()
+    # Preemptive AB: steps
+    if not tracker.try_step():
+        return fail_budget(
+            "autonomy_budget_exceeded",
+            "max_steps exceeded",
+            tracker=tracker,
+            deh_evidence=deh_evidence,
+        )
 
-    # Check budget AFTER incrementing (catches budget exhausted by this call)
-    budget_error = tracker.check_limits()
-    if budget_error:
-        return {
-            "error": "autonomy_budget_exceeded",
-            "detail": budget_error,
-            "usage": tracker.get_usage(),
-            "deh_evidence": deh_evidence,
-            "exit_code": -1,
-        }
+    # Preemptive AB: tool calls
+    if not tracker.try_tool_call():
+        return fail_budget(
+            "autonomy_budget_exceeded",
+            "max_tool_calls exceeded",
+            tracker=tracker,
+            deh_evidence=deh_evidence,
+        )
+
+    # Preemptive AB: runtime before tool execution
+    if tracker.runtime_exceeded():
+        return fail_budget(
+            "autonomy_budget_exceeded",
+            "max_runtime_seconds exceeded before tool execution",
+            tracker=tracker,
+            deh_evidence=deh_evidence,
+        )
+
+    # V1 Step 2.5: Write scope gating - tools declare blast radius, budget decides
+    required_scope = TOOL_WRITE_SCOPE_REQUIREMENTS.get(tool, "sandbox")
+    allowed_scope = budget.get("max_write_scope", "sandbox")
+    if scope_rank(required_scope) > scope_rank(allowed_scope):
+        return fail_budget(
+            "budget_scope_violation",
+            f"tool '{tool}' requires write_scope '{required_scope}' but budget allows '{allowed_scope}'",
+            tracker=tracker,
+            deh_evidence=deh_evidence,
+        )
 
     if tool == "echo":
         result = tool_echo(inputs.get("message", ""), timeout_seconds)
@@ -482,7 +573,8 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
         result["exit_code"] = -1
 
     # Add governance telemetry to result
-    result["autonomy_usage"] = tracker.get_usage()
+    result["autonomy_budget"] = budget  # What was allowed (immutable snapshot)
+    result["autonomy_usage"] = tracker.get_usage()  # What was consumed
     result["envelope_hash"] = job.get("envelope_hash")
     result["deh_evidence"] = deh_evidence  # Machine-verifiable proof
 
@@ -493,12 +585,13 @@ def report_result(job_id: str, proposal_id: str, status: str, output: Dict[str, 
     """
     Report result back to API with manifest metadata.
     Phase 5 Step 3: bounded payload.
-    V1 Governance: includes completion_artifacts, envelope_hash, autonomy_usage, deh_evidence.
+    V1 Governance: includes completion_artifacts, envelope_hash, autonomy_budget, autonomy_usage, deh_evidence.
     """
     # Extract V1 governance fields from output (added by execute_job)
     completion_artifacts = output.pop("completion_artifacts", None)
     envelope_hash = output.pop("envelope_hash", None)
-    autonomy_usage = output.pop("autonomy_usage", None)
+    autonomy_budget = output.pop("autonomy_budget", None)  # What was allowed
+    autonomy_usage = output.pop("autonomy_usage", None)    # What was consumed
     deh_evidence = output.pop("deh_evidence", None)
 
     payload = {
@@ -511,8 +604,9 @@ def report_result(job_id: str, proposal_id: str, status: str, output: Dict[str, 
         # V1 Governance fields
         "completion_artifacts": completion_artifacts,
         "envelope_hash": envelope_hash,
-        "autonomy_usage": autonomy_usage,
-        "deh_evidence": deh_evidence,  # Machine-verifiable DEH proof
+        "autonomy_budget": autonomy_budget,   # Forensic: what was allowed
+        "autonomy_usage": autonomy_usage,     # Forensic: what was consumed
+        "deh_evidence": deh_evidence,         # Machine-verifiable DEH proof
     }
 
     # Phase 5 Step 3: Enforce byte size cap on outbound results

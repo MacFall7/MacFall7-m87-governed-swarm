@@ -530,7 +530,9 @@ class RunnerResult(BaseModel):
     # V1 Governance: Artifact-Backed Completion
     completion_artifacts: Optional[CompletionArtifacts] = None
     envelope_hash: Optional[str] = Field(None, min_length=64, max_length=64)
-    autonomy_usage: Optional[Dict[str, Any]] = None
+    # V1 Step 2: Autonomy Budget forensics
+    autonomy_budget: Optional[Dict[str, Any]] = None  # What was allowed
+    autonomy_usage: Optional[Dict[str, Any]] = None   # What was consumed
     # V1 Governance: DEH verification evidence (machine-verifiable proof)
     deh_evidence: Optional[Dict[str, Any]] = None
 
@@ -1348,7 +1350,8 @@ def runner_result(result: RunnerResult, x_m87_key: Optional[str] = Header(None, 
         "manifest_hash": result.manifest_hash,
         "manifest_version": result.manifest_version,
         "envelope_hash": result.envelope_hash,
-        "autonomy_usage": result.autonomy_usage,
+        "autonomy_budget": result.autonomy_budget,  # Forensic: what was allowed
+        "autonomy_usage": result.autonomy_usage,    # Forensic: what was consumed
         "has_artifacts": result.completion_artifacts.has_artifacts() if result.completion_artifacts else False,
         "deh_evidence": result.deh_evidence,  # Machine-verifiable DEH proof from runner
         "received_at": datetime.utcnow().isoformat() + "Z",
