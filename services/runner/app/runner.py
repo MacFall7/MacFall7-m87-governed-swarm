@@ -1,7 +1,9 @@
 """
-M87 Runner Service - V1.3+ (Phase 4: Tool Manifest)
+M87 Runner Service - V1.5+ (V1 Governance Hardening)
 Consumes JobSpecs from m87:jobs stream ONLY.
 Executes tools ONLY if declared in tool_manifest.json.
+Enforces Deployment Envelope Hash (DEH) verification.
+Enforces Autonomy Budget limits.
 """
 
 import os
@@ -27,6 +29,82 @@ MANIFEST_LOCK_PATH = os.getenv("M87_MANIFEST_LOCK_PATH", "manifest.lock.json")
 
 # Phase 5 Step 3: Result payload cap
 MAX_REPORT_BYTES = int(os.getenv("M87_MAX_RUNNER_RESULT_BYTES", "65536"))
+
+
+# ---- V1 Governance: Deployment Envelope Hash verification
+def compute_envelope_hash(envelope: Dict[str, Any]) -> str:
+    """Compute DEH = SHA256(canonical_json(deployment_envelope))"""
+    canonical = json.dumps(envelope, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def verify_deployment_envelope(job: Dict[str, Any]) -> Optional[str]:
+    """
+    Verify job's deployment envelope hash matches recomputed hash.
+    Returns error string if mismatch, None if OK.
+    """
+    envelope = job.get("deployment_envelope")
+    claimed_hash = job.get("envelope_hash")
+
+    if not claimed_hash:
+        return "Job missing envelope_hash (pre-V1.0 API?)"
+
+    if not envelope:
+        return "Job missing deployment_envelope for verification"
+
+    recomputed = compute_envelope_hash(envelope)
+    if recomputed != claimed_hash:
+        return f"DEH mismatch: claimed {claimed_hash[:16]}... but computed {recomputed[:16]}..."
+
+    return None
+
+
+# ---- V1 Governance: Autonomy Budget tracking
+class AutonomyBudgetTracker:
+    """Tracks resource usage against autonomy budget limits."""
+
+    def __init__(self, budget: Dict[str, Any]):
+        self.budget = budget
+        self.steps = 0
+        self.tool_calls = 0
+        self.parallel_agents = 0
+        self.external_io = 0
+        self.start_time = time.time()
+
+    def check_limits(self) -> Optional[str]:
+        """Check if any limit is exceeded. Returns error string or None."""
+        elapsed = time.time() - self.start_time
+
+        if self.steps >= self.budget.get("max_steps", 100):
+            return f"AUTONOMY_BUDGET_EXCEEDED: steps ({self.steps})"
+
+        if self.tool_calls >= self.budget.get("max_tool_calls", 50):
+            return f"AUTONOMY_BUDGET_EXCEEDED: tool_calls ({self.tool_calls})"
+
+        if elapsed >= self.budget.get("max_runtime_seconds", 300):
+            return f"AUTONOMY_BUDGET_EXCEEDED: runtime ({elapsed:.0f}s)"
+
+        if self.external_io >= self.budget.get("max_external_io", 10):
+            return f"AUTONOMY_BUDGET_EXCEEDED: external_io ({self.external_io})"
+
+        return None
+
+    def increment_step(self):
+        self.steps += 1
+
+    def increment_tool_call(self):
+        self.tool_calls += 1
+
+    def increment_external_io(self):
+        self.external_io += 1
+
+    def get_usage(self) -> Dict[str, Any]:
+        return {
+            "steps": self.steps,
+            "tool_calls": self.tool_calls,
+            "runtime_seconds": time.time() - self.start_time,
+            "external_io": self.external_io,
+        }
 
 
 def _api_headers() -> Dict[str, str]:
@@ -127,9 +205,27 @@ def validate_job_against_manifest(job: Dict[str, Any], manifest: Dict[str, Any])
 
 
 # ---- Tool implementations (the runner is allowed to be boring)
+# V1 Governance: Tools must produce completion artifacts
+
+def _make_receipt(action: str, proof: str = None) -> Dict[str, Any]:
+    """Create a receipt artifact."""
+    return {
+        "action": action,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "proof": proof,
+    }
+
+
+def _make_log_artifact(source: str, content: str) -> Dict[str, Any]:
+    """Create a log artifact with hash."""
+    return {
+        "source": source,
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
+
 
 def tool_echo(message: str, timeout_seconds: int) -> Dict[str, Any]:
-    """Execute echo command with timeout enforcement."""
+    """Execute echo command with timeout enforcement. Returns artifacts."""
     try:
         completed = subprocess.run(
             ["echo", message],
@@ -138,13 +234,24 @@ def tool_echo(message: str, timeout_seconds: int) -> Dict[str, Any]:
             check=True,
             timeout=timeout_seconds
         )
-        return {"stdout": completed.stdout.strip(), "exit_code": 0}
+        output = completed.stdout.strip()
+        return {
+            "stdout": output,
+            "exit_code": 0,
+            # V1: Completion artifacts
+            "completion_artifacts": {
+                "files": [],
+                "diffs": [],
+                "logs": [_make_log_artifact("echo_stdout", output)],
+                "receipts": [_make_receipt("echo", proof=hashlib.sha256(message.encode()).hexdigest()[:16])],
+            }
+        }
     except subprocess.TimeoutExpired:
         return {"error": "timeout", "exit_code": -1}
 
 
 def tool_pytest(args: str, timeout_seconds: int) -> Dict[str, Any]:
-    """Execute pytest with timeout enforcement."""
+    """Execute pytest with timeout enforcement. Returns artifacts."""
     # Keep it safe: don't allow shell=True, no arbitrary command expansion
     # args is passed as tokens after splitting on spaces
     cmd = ["pytest"] + ([a for a in args.split(" ") if a] if args else [])
@@ -155,17 +262,38 @@ def tool_pytest(args: str, timeout_seconds: int) -> Dict[str, Any]:
             text=True,
             timeout=timeout_seconds
         )
+        stdout = (completed.stdout or "")[-8000:]  # cap output
+        stderr = (completed.stderr or "")[-8000:]
+        combined = stdout + stderr
+
         return {
             "exit_code": completed.returncode,
-            "stdout": (completed.stdout or "")[-8000:],  # cap output
-            "stderr": (completed.stderr or "")[-8000:]
+            "stdout": stdout,
+            "stderr": stderr,
+            # V1: Completion artifacts
+            "completion_artifacts": {
+                "files": [],
+                "diffs": [],
+                "logs": [
+                    _make_log_artifact("pytest_stdout", stdout),
+                    _make_log_artifact("pytest_stderr", stderr),
+                ],
+                "receipts": [_make_receipt("pytest", proof=f"exit_code={completed.returncode}")],
+            }
         }
     except subprocess.TimeoutExpired:
         return {"error": "timeout", "exit_code": -1, "stdout": "", "stderr": ""}
 
 
 def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]:
-    """Execute job with manifest-defined timeout and drift detection."""
+    """
+    Execute job with governance controls:
+    - Manifest hash drift refusal
+    - Deployment Envelope Hash (DEH) verification
+    - Autonomy Budget enforcement
+    """
+    job_id = job.get("job_id", "unknown")
+
     # Phase 5 Step 2: Manifest hash drift refusal
     job_hash = job.get("manifest_hash")
     runner_hash = manifest.get("_manifest_hash")
@@ -186,23 +314,75 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
             "exit_code": -1,
         }
 
+    # V1 Governance: Deployment Envelope Hash verification
+    deh_error = verify_deployment_envelope(job)
+    if deh_error:
+        print(f"  ✗ DEH verification failed: {deh_error}", flush=True)
+        return {
+            "error": "deh_verification_failed",
+            "detail": deh_error,
+            "exit_code": -1,
+        }
+
+    # V1 Governance: Initialize autonomy budget tracker
+    budget = job.get("autonomy_budget", {})
+    tracker = AutonomyBudgetTracker(budget)
+
+    # Check budget before execution
+    budget_error = tracker.check_limits()
+    if budget_error:
+        return {
+            "error": "autonomy_budget_exceeded",
+            "detail": budget_error,
+            "usage": tracker.get_usage(),
+            "exit_code": -1,
+        }
+
     tool = job["tool"]
     inputs = job.get("inputs", {})
     tool_spec = manifest.get("tools", {}).get(tool, {})
     timeout_seconds = int(tool_spec.get("timeout_seconds", 30))
 
+    # Track tool call
+    tracker.increment_tool_call()
+    tracker.increment_step()
+
+    # Check budget after incrementing
+    budget_error = tracker.check_limits()
+    if budget_error:
+        return {
+            "error": "autonomy_budget_exceeded",
+            "detail": budget_error,
+            "usage": tracker.get_usage(),
+            "exit_code": -1,
+        }
+
     if tool == "echo":
-        return tool_echo(inputs.get("message", ""), timeout_seconds)
+        result = tool_echo(inputs.get("message", ""), timeout_seconds)
+    elif tool == "pytest":
+        result = tool_pytest(inputs.get("args", ""), timeout_seconds)
+    else:
+        # Should never happen due to manifest validation
+        raise RuntimeError(f"Unhandled tool: {tool}")
 
-    if tool == "pytest":
-        return tool_pytest(inputs.get("args", ""), timeout_seconds)
+    # Add usage telemetry to result
+    result["autonomy_usage"] = tracker.get_usage()
+    result["envelope_hash"] = job.get("envelope_hash")
 
-    # Should never happen due to manifest validation
-    raise RuntimeError(f"Unhandled tool: {tool}")
+    return result
 
 
 def report_result(job_id: str, proposal_id: str, status: str, output: Dict[str, Any], manifest: Dict[str, Any]) -> None:
-    """Report result back to API with manifest metadata. Phase 5 Step 3: bounded payload."""
+    """
+    Report result back to API with manifest metadata.
+    Phase 5 Step 3: bounded payload.
+    V1 Governance: includes completion_artifacts, envelope_hash, autonomy_usage.
+    """
+    # Extract V1 governance fields from output (added by execute_job)
+    completion_artifacts = output.pop("completion_artifacts", None)
+    envelope_hash = output.pop("envelope_hash", None)
+    autonomy_usage = output.pop("autonomy_usage", None)
+
     payload = {
         "job_id": job_id,
         "proposal_id": proposal_id,
@@ -210,12 +390,16 @@ def report_result(job_id: str, proposal_id: str, status: str, output: Dict[str, 
         "output": output,
         "manifest_hash": manifest.get("_manifest_hash"),
         "manifest_version": manifest.get("version"),
+        # V1 Governance fields
+        "completion_artifacts": completion_artifacts,
+        "envelope_hash": envelope_hash,
+        "autonomy_usage": autonomy_usage,
     }
 
     # Phase 5 Step 3: Enforce byte size cap on outbound results
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     if len(raw) > MAX_REPORT_BYTES:
-        # Hard truncate output fields locally
+        # Hard truncate output fields locally (preserve artifacts for completion verification)
         payload["output"] = {"error": "runner_output_too_large", "bytes": len(raw)}
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 

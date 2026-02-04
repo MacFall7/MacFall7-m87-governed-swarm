@@ -407,6 +407,8 @@ class Proposal(BaseModel):
     artifacts: Optional[List[Dict[str, str]]] = None
     truth_account: TruthAccount
     risk_score: Optional[float] = None
+    # V1 Governance: Optional deployment envelope (defaults applied if not provided)
+    deployment_envelope: Optional[Dict[str, Any]] = None
 
 
 class GovernanceDecision(BaseModel):
@@ -415,6 +417,7 @@ class GovernanceDecision(BaseModel):
     reasons: List[str]
     required_approvals: Optional[List[str]] = None
     allowed_effects: Optional[List[EffectTag]] = None
+    job_id: Optional[str] = None  # V1: included when job is minted
 
 
 class JobSpec(BaseModel):
@@ -430,6 +433,93 @@ class JobSpec(BaseModel):
 RunnerStatus = Literal["completed", "failed", "manifest_reject"]
 
 
+# V1 Governance: Artifact-Backed Completion
+class FileArtifact(BaseModel):
+    """Verifiable file artifact with hash."""
+    path: str = Field(..., min_length=1, max_length=512)
+    sha256: str = Field(..., min_length=64, max_length=64)
+
+
+class DiffArtifact(BaseModel):
+    """Verifiable diff artifact with hash."""
+    target: str = Field(..., min_length=1, max_length=512)
+    diff_hash: str = Field(..., min_length=64, max_length=64)
+
+
+class LogArtifact(BaseModel):
+    """Verifiable log artifact with hash."""
+    source: str = Field(..., min_length=1, max_length=256)
+    sha256: str = Field(..., min_length=64, max_length=64)
+
+
+class ReceiptArtifact(BaseModel):
+    """Action receipt with proof."""
+    action: str = Field(..., min_length=1, max_length=256)
+    timestamp: str
+    proof: Optional[str] = None
+
+
+class CompletionArtifacts(BaseModel):
+    """
+    Verifiable artifacts required for task completion.
+    A task cannot be marked complete without returning artifacts.
+    """
+    files: List[FileArtifact] = Field(default_factory=list)
+    diffs: List[DiffArtifact] = Field(default_factory=list)
+    logs: List[LogArtifact] = Field(default_factory=list)
+    receipts: List[ReceiptArtifact] = Field(default_factory=list)
+
+    def has_artifacts(self) -> bool:
+        """Check if any artifacts are present."""
+        return bool(self.files or self.diffs or self.logs or self.receipts)
+
+
+# V1 Governance: Continuous Shadow Evaluations (CSE)
+class ShadowEvalConfig(BaseModel):
+    """Configuration for shadow evaluations."""
+    eval_suite_hash: str = Field(..., min_length=64, max_length=64)
+    prompt_family_hash: str = Field(..., min_length=64, max_length=64)
+    scoring_function_hash: str = Field(..., min_length=64, max_length=64)
+    trigger_interval_jobs: int = Field(default=100, ge=1, le=10000)
+    drift_threshold: float = Field(default=0.1, ge=0, le=1.0)
+
+
+class ShadowEvalResult(BaseModel):
+    """Result from a shadow evaluation run."""
+    eval_id: str
+    envelope_hash: str
+    eval_suite_hash: str
+    drift_score: float
+    passed: bool
+    details: Dict[str, Any] = Field(default_factory=dict)
+    run_at: str
+
+
+class ShadowEvalTrigger(BaseModel):
+    """Trigger conditions for shadow evaluation."""
+    reason: str  # "interval", "envelope_change", "anomaly", "manual"
+    job_id: Optional[str] = None
+    envelope_hash: Optional[str] = None
+
+
+# Shadow eval state (in-memory for now, would be persisted in production)
+_shadow_eval_state = {
+    "jobs_since_last_eval": 0,
+    "last_eval_at": None,
+    "last_drift_score": 0.0,
+    "eval_history": [],
+}
+
+# Default shadow eval config (placeholder hashes)
+DEFAULT_SHADOW_EVAL_CONFIG = ShadowEvalConfig(
+    eval_suite_hash="0" * 64,  # Placeholder
+    prompt_family_hash="0" * 64,  # Placeholder
+    scoring_function_hash="0" * 64,  # Placeholder
+    trigger_interval_jobs=100,
+    drift_threshold=0.1,
+)
+
+
 class RunnerResult(BaseModel):
     job_id: str = Field(..., min_length=8, max_length=128)
     proposal_id: str = Field(..., min_length=1, max_length=128)
@@ -437,6 +527,10 @@ class RunnerResult(BaseModel):
     output: Dict[str, Any] = Field(default_factory=dict)
     manifest_hash: Optional[str] = Field(None, min_length=64, max_length=64)
     manifest_version: Optional[str] = Field(None, max_length=32)
+    # V1 Governance: Artifact-Backed Completion
+    completion_artifacts: Optional[CompletionArtifacts] = None
+    envelope_hash: Optional[str] = Field(None, min_length=64, max_length=64)
+    autonomy_usage: Optional[Dict[str, Any]] = None
 
 
 class CreateKeyRequest(BaseModel):
@@ -448,25 +542,112 @@ class CreateKeyRequest(BaseModel):
     description: Optional[str] = None
 
 
+# ---- V1 Governance Hardening: Deployment Envelope + Autonomy Budget
+WriteScope = Literal["none", "sandbox", "staging", "prod"]
+SafetyMode = Literal["safe_default", "governed", "restricted"]
+ModelSource = Literal["closed", "open"]
+
+
+class AutonomyBudget(BaseModel):
+    """Rate and magnitude limits on agent behavior."""
+    max_steps: int = Field(default=100, ge=1, le=10000)
+    max_tool_calls: int = Field(default=50, ge=1, le=1000)
+    max_parallel_agents: int = Field(default=1, ge=1, le=10)
+    max_runtime_seconds: int = Field(default=300, ge=1, le=3600)
+    max_external_io: int = Field(default=10, ge=0, le=100)
+    max_write_scope: WriteScope = "sandbox"
+
+
+class InferencePolicy(BaseModel):
+    """Runtime behavior constraints for model inference."""
+    reasoning_mode: bool = False
+    tool_access_profile: str = "default"
+    max_compute_class: str = "standard"
+
+
+class DeploymentEnvelope(BaseModel):
+    """
+    Chain of custody for model + runtime configuration.
+    Extends governance beyond tool manifests to post-training + runtime behavior.
+    """
+    model_id: str = Field(..., min_length=1, max_length=256)
+    model_source: ModelSource = "closed"
+    weights_hash: Optional[str] = Field(None, min_length=64, max_length=64)
+    post_training_recipe_hash: Optional[str] = Field(None, min_length=64, max_length=64)
+    inference_policy: InferencePolicy = Field(default_factory=InferencePolicy)
+    safety_mode: SafetyMode = "safe_default"
+    autonomy_budget: AutonomyBudget = Field(default_factory=AutonomyBudget)
+
+
+def compute_deployment_envelope_hash(envelope: DeploymentEnvelope) -> str:
+    """Compute DEH = SHA256(canonical_json(deployment_envelope))"""
+    # Canonical JSON: sorted keys, no extra whitespace
+    canonical = json.dumps(envelope.model_dump(), sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# Default envelope for backward compatibility (open-weight safe defaults)
+DEFAULT_ENVELOPE = DeploymentEnvelope(
+    model_id="m87-runner-v1",
+    model_source="closed",
+    safety_mode="safe_default",
+    autonomy_budget=AutonomyBudget(
+        max_steps=100,
+        max_tool_calls=50,
+        max_parallel_agents=1,
+        max_runtime_seconds=300,
+        max_external_io=10,
+        max_write_scope="sandbox",
+    ),
+)
+
+
 # ---- Job minting
-def enqueue_job(proposal_id: str, tool: str, inputs: Dict[str, Any] = None) -> str:
+def enqueue_job(
+    proposal_id: str,
+    tool: str,
+    inputs: Dict[str, Any] = None,
+    envelope: Optional[DeploymentEnvelope] = None,
+) -> str:
     """
     Mint a JobSpec and add to jobs stream.
     This is the ONLY way jobs get created - after governance.
 
     V0.3.0: Persists job to Postgres (write-through).
     V0.4.0: Pins manifest_hash for drift detection.
+    V1.0.0: Includes deployment envelope + DEH.
     """
     if tool not in ALLOWED_TOOLS:
         raise ValueError(f"Tool '{tool}' not in allowlist: {ALLOWED_TOOLS}")
 
     job_id = str(uuid.uuid4())
-    sandbox = {"network": "deny", "fs": "ro"}
-    timeout_seconds = 60
     job_inputs = inputs or {}
 
     # Phase 5: Pin manifest hash at job mint time
     manifest_hash = current_manifest_hash_or_die()
+
+    # V1 Governance: Use provided envelope or default
+    job_envelope = envelope or DEFAULT_ENVELOPE
+
+    # Open-weight safety: force safe defaults
+    if job_envelope.model_source == "open":
+        job_envelope = DeploymentEnvelope(
+            **{**job_envelope.model_dump(), "safety_mode": "safe_default"}
+        )
+
+    # Compute Deployment Envelope Hash
+    envelope_hash = compute_deployment_envelope_hash(job_envelope)
+
+    # Sandbox derived from envelope write scope
+    write_scope = job_envelope.autonomy_budget.max_write_scope
+    sandbox = {
+        "network": "deny" if write_scope in ("none", "sandbox") else "allow",
+        "fs": "ro" if write_scope == "none" else "rw",
+        "write_scope": write_scope,
+    }
+
+    # Timeout from autonomy budget
+    timeout_seconds = min(job_envelope.autonomy_budget.max_runtime_seconds, 3600)
 
     job = {
         "job_id": job_id,
@@ -476,6 +657,12 @@ def enqueue_job(proposal_id: str, tool: str, inputs: Dict[str, Any] = None) -> s
         "sandbox": sandbox,
         "timeout_seconds": timeout_seconds,
         "manifest_hash": manifest_hash,
+        # V1 Governance fields
+        "envelope_hash": envelope_hash,
+        "deployment_envelope": job_envelope.model_dump(),  # Full envelope for runner verification
+        "autonomy_budget": job_envelope.autonomy_budget.model_dump(),
+        "safety_mode": job_envelope.safety_mode,
+        "model_id": job_envelope.model_id,
     }
 
     # Phase 2: Persist job to Postgres (write-through)
@@ -497,7 +684,15 @@ def enqueue_job(proposal_id: str, tool: str, inputs: Dict[str, Any] = None) -> s
             )
 
     rdb.xadd(JOB_STREAM, {"job": json.dumps(job)})
-    emit("job.created", {"job_id": job_id, "proposal_id": proposal_id, "tool": tool})
+
+    # V1 Telemetry: JOB_ACCEPTED with envelope_hash
+    emit("job.created", {
+        "job_id": job_id,
+        "proposal_id": proposal_id,
+        "tool": tool,
+        "envelope_hash": envelope_hash,
+        "safety_mode": job_envelope.safety_mode,
+    })
 
     return job_id
 
@@ -523,6 +718,98 @@ def check_agent_risk(agent: str, risk_score: Optional[float]) -> tuple[bool, flo
     if risk_score is None:
         return True, max_risk
     return risk_score <= max_risk, max_risk
+
+
+# ---- V1 Governance: Shadow Eval endpoints
+
+@app.post("/v1/shadow-eval/trigger")
+def trigger_shadow_eval(
+    trigger: ShadowEvalTrigger,
+    x_m87_key: Optional[str] = Header(None, alias="X-M87-Key"),
+):
+    """
+    Trigger a shadow evaluation run.
+    V1 Governance: Continuous Shadow Evaluations for drift detection.
+    """
+    verify_auth(x_m87_key, "admin:shadow-eval")
+
+    eval_id = str(uuid.uuid4())
+    config = DEFAULT_SHADOW_EVAL_CONFIG
+
+    # Stub: In production, this would run actual evaluations
+    # For now, emit telemetry and return a placeholder result
+    drift_score = 0.0  # Placeholder - would be computed from actual eval
+    passed = drift_score < config.drift_threshold
+
+    result = ShadowEvalResult(
+        eval_id=eval_id,
+        envelope_hash=trigger.envelope_hash or "unknown",
+        eval_suite_hash=config.eval_suite_hash,
+        drift_score=drift_score,
+        passed=passed,
+        details={
+            "trigger_reason": trigger.reason,
+            "job_id": trigger.job_id,
+            "stub": True,  # Indicates this is a stub implementation
+        },
+        run_at=datetime.utcnow().isoformat() + "Z",
+    )
+
+    # Update state
+    _shadow_eval_state["last_eval_at"] = result.run_at
+    _shadow_eval_state["last_drift_score"] = drift_score
+    _shadow_eval_state["jobs_since_last_eval"] = 0
+    _shadow_eval_state["eval_history"].append(result.model_dump())
+    if len(_shadow_eval_state["eval_history"]) > 100:
+        _shadow_eval_state["eval_history"] = _shadow_eval_state["eval_history"][-100:]
+
+    # Emit telemetry
+    emit("shadow_eval.run", {
+        "eval_id": eval_id,
+        "envelope_hash": trigger.envelope_hash,
+        "drift_score": drift_score,
+        "passed": passed,
+        "trigger_reason": trigger.reason,
+    })
+
+    if not passed:
+        emit("shadow_eval.drift_detected", {
+            "eval_id": eval_id,
+            "envelope_hash": trigger.envelope_hash,
+            "drift_score": drift_score,
+            "threshold": config.drift_threshold,
+        })
+
+    return result
+
+
+@app.get("/v1/shadow-eval/status")
+def shadow_eval_status(x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
+    """Get current shadow evaluation status."""
+    verify_auth(x_m87_key, "admin:shadow-eval")
+
+    return {
+        "jobs_since_last_eval": _shadow_eval_state["jobs_since_last_eval"],
+        "last_eval_at": _shadow_eval_state["last_eval_at"],
+        "last_drift_score": _shadow_eval_state["last_drift_score"],
+        "trigger_interval": DEFAULT_SHADOW_EVAL_CONFIG.trigger_interval_jobs,
+        "drift_threshold": DEFAULT_SHADOW_EVAL_CONFIG.drift_threshold,
+        "recent_evals": _shadow_eval_state["eval_history"][-10:],
+    }
+
+
+def maybe_trigger_shadow_eval(job_id: str, envelope_hash: str) -> None:
+    """Check if shadow eval should be triggered based on job count."""
+    _shadow_eval_state["jobs_since_last_eval"] += 1
+
+    if _shadow_eval_state["jobs_since_last_eval"] >= DEFAULT_SHADOW_EVAL_CONFIG.trigger_interval_jobs:
+        # In production, this would actually trigger an eval
+        # For now, just emit telemetry
+        emit("shadow_eval.trigger_due", {
+            "jobs_since_last": _shadow_eval_state["jobs_since_last_eval"],
+            "trigger_threshold": DEFAULT_SHADOW_EVAL_CONFIG.trigger_interval_jobs,
+            "envelope_hash": envelope_hash,
+        })
 
 
 # ---- Endpoints
@@ -795,19 +1082,36 @@ def govern_proposal(
         decided_by="policy",
         allowed_effects=list(proposal.effects),
     )
+
+    # V1 Governance: Parse deployment envelope if provided
+    job_envelope = None
+    if proposal.deployment_envelope:
+        try:
+            job_envelope = DeploymentEnvelope(**proposal.deployment_envelope)
+        except Exception as e:
+            logger.warning(f"Invalid deployment envelope, using default: {e}")
+
     emit("proposal.allowed", {
         **decision.model_dump(),
         "agent": agent,
         "principal_id": auth.principal_id,
     })
 
-    enqueue_job(
+    job_id = enqueue_job(
         proposal_id=proposal.proposal_id,
         tool="echo",
-        inputs={"message": f"[{agent}] {proposal.summary}"}
+        inputs={"message": f"[{agent}] {proposal.summary}"},
+        envelope=job_envelope,
     )
 
-    return decision
+    # Return decision with job_id for convenience
+    return GovernanceDecision(
+        proposal_id=proposal.proposal_id,
+        decision="ALLOW",
+        reasons=reasons,
+        allowed_effects=proposal.effects,
+        job_id=job_id,
+    )
 
 
 @app.post("/v1/approve/{proposal_id}")
@@ -978,6 +1282,7 @@ def runner_result(result: RunnerResult, x_m87_key: Optional[str] = Header(None, 
     """
     Runner reports job completion/failure.
     Phase 5 Step 3: Hardened with size caps, redaction, and strict schema.
+    V1 Governance: Enforces Artifact-Backed Completion.
     """
     # Phase 2: Hard fail-safe
     require_persistence()
@@ -989,17 +1294,49 @@ def runner_result(result: RunnerResult, x_m87_key: Optional[str] = Header(None, 
     if len(raw_bytes) > MAX_RUNNER_RESULT_BYTES:
         raise HTTPException(status_code=413, detail=f"Result too large ({len(raw_bytes)} bytes)")
 
+    # V1 Governance: Artifact-Backed Completion enforcement
+    # "Completed: true" without artifacts → invalid
+    effective_status = result.status
+    artifact_rejection = None
+
+    if result.status == "completed":
+        has_artifacts = (
+            result.completion_artifacts is not None
+            and result.completion_artifacts.has_artifacts()
+        )
+        if not has_artifacts:
+            effective_status = "failed"
+            artifact_rejection = "TASK_INCOMPLETE: no completion artifacts provided"
+            logger.warning(f"Job {result.job_id}: completion rejected - no artifacts")
+            # Emit telemetry for artifact rejection
+            emit("task.completion_rejected", {
+                "job_id": result.job_id,
+                "proposal_id": result.proposal_id,
+                "reason": "NO_ARTIFACTS",
+                "envelope_hash": result.envelope_hash,
+            })
+
     # Sanitize output before anything else touches it
     safe_output = sanitize_output(result.output)
+
+    # Add artifact rejection reason if applicable
+    if artifact_rejection:
+        if isinstance(safe_output, dict):
+            safe_output["artifact_rejection"] = artifact_rejection
+        else:
+            safe_output = {"original": safe_output, "artifact_rejection": artifact_rejection}
 
     # Build payload with sanitized output
     payload = {
         "job_id": result.job_id,
         "proposal_id": result.proposal_id,
-        "status": result.status,
+        "status": effective_status,
         "output": safe_output,
         "manifest_hash": result.manifest_hash,
         "manifest_version": result.manifest_version,
+        "envelope_hash": result.envelope_hash,
+        "autonomy_usage": result.autonomy_usage,
+        "has_artifacts": result.completion_artifacts.has_artifacts() if result.completion_artifacts else False,
         "received_at": datetime.utcnow().isoformat() + "Z",
     }
 
@@ -1007,9 +1344,9 @@ def runner_result(result: RunnerResult, x_m87_key: Optional[str] = Header(None, 
     try:
         persist_execution(
             job_id=result.job_id,
-            status=result.status,
+            status=effective_status,
             output=safe_output,
-            error=safe_output.get("error") if isinstance(safe_output, dict) else None,
+            error=safe_output.get("error") if isinstance(safe_output, dict) else artifact_rejection,
             runner_id=auth.principal_id,
         )
     except PersistenceUnavailable as e:
@@ -1019,12 +1356,15 @@ def runner_result(result: RunnerResult, x_m87_key: Optional[str] = Header(None, 
             detail={"error": "DB_WRITE_FAILED", "message": str(e)}
         )
 
-    if result.status == "completed":
+    if effective_status == "completed":
         emit("job.completed", payload)
     else:
         emit("job.failed", payload)
 
-    return {"ok": True}
+    # V1 Governance: Check if shadow eval should be triggered
+    maybe_trigger_shadow_eval(result.job_id, result.envelope_hash or "unknown")
+
+    return {"ok": True, "effective_status": effective_status, "artifact_rejection": artifact_rejection}
 
 
 # ---- Admin endpoints (key management)
