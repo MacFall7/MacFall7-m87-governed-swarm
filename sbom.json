@@ -1,0 +1,121 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:m87-governed-swarm-2026-02-04",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-02-04T00:00:00Z",
+    "tools": [
+      {
+        "vendor": "M87",
+        "name": "manual-sbom-generator",
+        "version": "1.0.0"
+      }
+    ],
+    "component": {
+      "type": "application",
+      "name": "m87-governed-swarm",
+      "version": "1.0.0",
+      "description": "Policy-gated autonomous execution platform"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "fastapi",
+      "version": "0.115.6",
+      "purl": "pkg:pypi/fastapi@0.115.6",
+      "scope": "required",
+      "group": "apps/api"
+    },
+    {
+      "type": "library",
+      "name": "uvicorn",
+      "version": "0.34.0",
+      "purl": "pkg:pypi/uvicorn@0.34.0",
+      "scope": "required",
+      "group": "apps/api"
+    },
+    {
+      "type": "library",
+      "name": "pydantic",
+      "version": "2.10.6",
+      "purl": "pkg:pypi/pydantic@2.10.6",
+      "scope": "required",
+      "group": "apps/api"
+    },
+    {
+      "type": "library",
+      "name": "redis",
+      "version": "5.0.8",
+      "purl": "pkg:pypi/redis@5.0.8",
+      "scope": "required",
+      "group": "apps/api"
+    },
+    {
+      "type": "library",
+      "name": "sqlalchemy",
+      "version": "2.0.36",
+      "purl": "pkg:pypi/sqlalchemy@2.0.36",
+      "scope": "required",
+      "group": "apps/api"
+    },
+    {
+      "type": "library",
+      "name": "psycopg2-binary",
+      "version": "2.9.10",
+      "purl": "pkg:pypi/psycopg2-binary@2.9.10",
+      "scope": "required",
+      "group": "apps/api"
+    },
+    {
+      "type": "library",
+      "name": "alembic",
+      "version": "1.14.0",
+      "purl": "pkg:pypi/alembic@1.14.0",
+      "scope": "required",
+      "group": "apps/api"
+    },
+    {
+      "type": "library",
+      "name": "requests",
+      "version": "2.32.3",
+      "purl": "pkg:pypi/requests@2.32.3",
+      "scope": "required",
+      "group": "services/runner"
+    },
+    {
+      "type": "container",
+      "name": "postgres",
+      "version": "15-alpine",
+      "purl": "pkg:docker/postgres@15-alpine",
+      "scope": "required",
+      "group": "infrastructure"
+    },
+    {
+      "type": "container",
+      "name": "redis",
+      "version": "7-alpine",
+      "purl": "pkg:docker/redis@7-alpine",
+      "scope": "required",
+      "group": "infrastructure"
+    }
+  ],
+  "services": [
+    {
+      "name": "api",
+      "description": "Governance API - policy enforcement endpoint",
+      "endpoints": ["/v1/govern/proposal", "/v2/govern/proposal"]
+    },
+    {
+      "name": "runner",
+      "description": "Airgapped tool executor",
+      "endpoints": []
+    },
+    {
+      "name": "notifier",
+      "description": "Event notification service",
+      "endpoints": []
+    }
+  ]
+}

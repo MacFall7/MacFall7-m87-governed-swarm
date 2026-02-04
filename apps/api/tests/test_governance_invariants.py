@@ -22,6 +22,7 @@ import os
 os.environ["M87_API_KEY"] = "test-bootstrap-key"
 os.environ["DATABASE_URL"] = ""
 os.environ["REDIS_URL"] = "redis://localhost:6379/0"
+os.environ["M87_TOOL_MANIFEST_PATH"] = "/nonexistent/manifest.json"  # Will be mocked
 
 
 class TestGovernanceInvariants:
@@ -36,6 +37,10 @@ class TestGovernanceInvariants:
         mock.hgetall.return_value = {}
         mock.get.return_value = None
         mock.set.return_value = True
+        # Phase 3-6 governance: SessionRiskTracker uses sorted sets
+        mock.zrangebyscore.return_value = []  # Empty history
+        mock.zadd.return_value = 1
+        mock.expire.return_value = True
         return mock
 
     @pytest.fixture
@@ -80,7 +85,10 @@ class TestGovernanceInvariants:
              patch("app.main._db_available", True), \
              patch("app.main.persist_proposal") as mock_persist_proposal, \
              patch("app.main.persist_decision") as mock_persist_decision, \
-             patch("app.main.persist_job") as mock_persist_job:
+             patch("app.main.persist_job") as mock_persist_job, \
+             patch("app.main.enqueue_job") as mock_enqueue_job:
+            # Mock enqueue_job to return a fake job_id
+            mock_enqueue_job.return_value = "mock-job-id-12345"
 
             # Configure mock verifier to allow bootstrap key
             from app.auth import AuthDecision, AuthReasonCode
@@ -257,7 +265,7 @@ class TestGovernanceInvariants:
             },
         )
 
-        assert response.status_code == 200
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
         data = response.json()
         assert data["decision"] == "ALLOW"
 
