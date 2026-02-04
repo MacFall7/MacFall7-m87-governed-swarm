@@ -35,6 +35,29 @@ This repo implements a fail-closed governance perimeter for all executable agent
 
 **All enforcement happens in the Runner—the only component authorized to execute tools—so policy can't be bypassed by upstream orchestration.**
 
+### API Governance (Phase 3-6)
+
+The API enforces additional governance before jobs are even minted:
+
+4. **Session Risk Tracking (Phase 3)**
+   - Redis-backed sliding-window cumulative effect tracking
+   - **Toxic topology detection**: Catches salami-slicing attacks (e.g., `READ_REPO` → `NETWORK_CALL`)
+   - Fail-closed on Redis blindness for exfil-adjacent effects
+
+5. **Code Artifact Inspection (Phase 5)**
+   - Tripwire scan for exfil primitives (`import requests`, `subprocess`, `os.environ`, etc.)
+   - Bounded inspection via subprocess (async-safe, DoS-resistant)
+
+6. **Human Override Protection (Phase 6)**
+   - Challenge-response for `REQUIRE_HUMAN` decisions
+   - Proposal hash binding prevents replay and bait-switch attacks
+
+### No Bypass Guarantee
+
+**Both `/v1` and `/v2` governance endpoints flow through the same Phase 3-6 enforcement lane.**
+
+No execution path can enqueue jobs without passing Phase 3-6 governance.
+
 ---
 
 ## What This Is

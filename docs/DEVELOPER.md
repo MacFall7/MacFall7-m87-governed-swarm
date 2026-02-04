@@ -462,6 +462,20 @@ Tools must return verifiable completion artifacts. The runner will force failure
 
 Runner must independently clamp risky configurations (e.g., open-weight models forced to `safe_default` + sandbox write scope).
 
+### 6. Kill-switches (Emergency Only)
+
+The following environment variables can disable governance for emergency rollback:
+
+| Variable | Effect | Warning |
+|----------|--------|---------|
+| `M87_DISABLE_PHASE36_GOVERNANCE=1` | Disables Phase 3-6 in /v1 endpoint | **DANGEROUS**: Allows toxic topologies |
+| `M87_DISABLE_V1_GOVERNANCE=1` | Returns 410 for all /v1 governance endpoints | Safe: forces migration to /v2 |
+
+**Production requirements for kill-switches:**
+- Log loudly on startup if enabled
+- Emit Prometheus metric so it can't be silently left on
+- Fail deployment if set outside dev/staging environment
+
 ---
 
 ## Contributing

@@ -354,6 +354,50 @@ Runner results include:
 
 ---
 
+## API Governance Stack (Phase 3-6)
+
+The API enforces additional governance before jobs are minted.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    API GOVERNANCE STACK                      │
+├─────────────────────────────────────────────────────────────┤
+│  Phase 3: Session Risk Tracking                              │
+│      └─ SessionRiskTracker (Redis-backed)                   │
+│      └─ Toxic topology detection (salami-slicing)           │
+│      └─ Fail-closed on sensor blindness                     │
+│                                                              │
+│  Phase 5: Code Artifact Inspection                           │
+│      └─ Tripwire scan (subprocess-based, async-safe)        │
+│      └─ Detects: socket, requests, subprocess, eval, etc.   │
+│                                                              │
+│  Phase 6: Human Override Protection                          │
+│      └─ Challenge-response for REQUIRE_HUMAN                │
+│      └─ Proposal hash binding (prevents replay)             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Toxic Topologies Detected
+
+| Topology | Effects | Decision |
+|----------|---------|----------|
+| `repo_read_then_network` | READ_REPO → NETWORK_CALL | REQUIRE_HUMAN |
+| `secrets_then_network` | READ_SECRETS → NETWORK_CALL | DENY |
+| `write_then_deploy` | WRITE_PATCH → DEPLOY | REQUIRE_HUMAN |
+
+### No Bypass Guarantee
+
+Both `/v1` and `/v2` governance endpoints delegate to the same Phase 3-6 enforcement:
+
+- `/v1/govern/proposal` → `evaluate_governance_proposal()` → Phase 3-6
+- `/v2/govern/proposal` → `evaluate_governance_proposal()` → Phase 3-6
+
+**No execution path can enqueue jobs without passing Phase 3-6 governance.**
+
+Kill-switch: `M87_DISABLE_PHASE36_GOVERNANCE=1` (emergency only, logs loudly)
+
+---
+
 ## Extending the System
 
 ### Adding a New Agent
