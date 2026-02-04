@@ -95,6 +95,11 @@ def enforce_open_weight_safety(envelope: Dict[str, Any]) -> Dict[str, Any]:
     """
     Defense-in-depth: Runner clamps open-weight models to safe defaults.
     Returns modified envelope (does not mutate input).
+
+    Enforces:
+    - safety_mode = "safe_default"
+    - max_write_scope = "sandbox" (closes "open model + prod writes" nightmare)
+    - Reduced autonomy budget limits
     """
     if envelope.get("model_source") != "open":
         return envelope
@@ -110,6 +115,7 @@ def enforce_open_weight_safety(envelope: Dict[str, Any]) -> Dict[str, Any]:
     OPEN_WEIGHT_MAX_STEPS = 50
     OPEN_WEIGHT_MAX_TOOL_CALLS = 25
     OPEN_WEIGHT_MAX_RUNTIME = 120
+    OPEN_WEIGHT_MAX_WRITE_SCOPE = "sandbox"
 
     if budget.get("max_steps", 0) > OPEN_WEIGHT_MAX_STEPS:
         print(f"  ⚠ Clamping open-weight max_steps: {budget['max_steps']} → {OPEN_WEIGHT_MAX_STEPS}", flush=True)
@@ -118,6 +124,12 @@ def enforce_open_weight_safety(envelope: Dict[str, Any]) -> Dict[str, Any]:
         budget["max_tool_calls"] = OPEN_WEIGHT_MAX_TOOL_CALLS
     if budget.get("max_runtime_seconds", 0) > OPEN_WEIGHT_MAX_RUNTIME:
         budget["max_runtime_seconds"] = OPEN_WEIGHT_MAX_RUNTIME
+
+    # CRITICAL: Clamp write scope - no prod/staging writes for open-weight models
+    current_scope = budget.get("max_write_scope", "sandbox")
+    if current_scope in ("prod", "staging"):
+        print(f"  ⚠ Clamping open-weight max_write_scope: {current_scope} → {OPEN_WEIGHT_MAX_WRITE_SCOPE}", flush=True)
+        budget["max_write_scope"] = OPEN_WEIGHT_MAX_WRITE_SCOPE
 
     clamped["autonomy_budget"] = budget
     return clamped
@@ -364,10 +376,19 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
     job_hash = job.get("manifest_hash")
     runner_hash = manifest.get("_manifest_hash")
 
+    # Partial evidence for early rejects (auditable signal even on manifest failures)
+    partial_deh_evidence = {
+        "envelope_hash_verified": False,
+        "deh_claimed": job.get("envelope_hash"),
+        "deh_recomputed": None,
+        "error": "manifest_check_failed_before_deh",
+    }
+
     if not job_hash:
         return {
             "error": "job_missing_manifest_hash",
             "detail": "Job was minted without manifest_hash (pre-V0.4.0 API?)",
+            "deh_evidence": partial_deh_evidence,
             "exit_code": -1,
         }
 
@@ -377,6 +398,7 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
             "detail": f"Job pinned hash {job_hash[:16]}... but runner has {runner_hash[:16]}...",
             "job_manifest_hash": job_hash,
             "runner_manifest_hash": runner_hash,
+            "deh_evidence": partial_deh_evidence,
             "exit_code": -1,
         }
 
@@ -441,7 +463,16 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
     # V1 Governance: Artifact-backed completion enforcement (runner-side)
     # Runner must not report "completed" without artifacts
     has_error = result.get("error") or result.get("exit_code", 0) != 0
-    has_artifacts = bool(result.get("completion_artifacts"))
+
+    # Strict artifact check: at least one list must have entries
+    # Prevents {completion_artifacts: {}} from passing
+    artifacts = result.get("completion_artifacts") or {}
+    has_artifacts = bool(
+        artifacts.get("files")
+        or artifacts.get("diffs")
+        or artifacts.get("logs")
+        or artifacts.get("receipts")
+    )
 
     if not has_error and not has_artifacts:
         # Tool ran successfully but didn't produce artifacts
