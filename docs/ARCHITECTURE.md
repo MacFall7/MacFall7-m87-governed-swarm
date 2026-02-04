@@ -304,6 +304,52 @@ This ensures Claude Code:
 - Understands what each service can/cannot do
 - Doesn't accidentally break invariants
 
+## Runner Governance Stack
+
+The Runner enforces defense-in-depth governance for all JobSpecs pulled from `m87:jobs`.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    RUNNER GOVERNANCE STACK                   │
+├─────────────────────────────────────────────────────────────┤
+│  (1) Capability Declaration                                  │
+│      └─ DeploymentEnvelope + DEH verification                │
+│                                                              │
+│  (2) Rate & Blast-Radius Control                             │
+│      └─ AutonomyBudget + preemptive try_* gates              │
+│      └─ Write scope gating (scope_rank)                      │
+│                                                              │
+│  (3) Egress Hard-Stop                                        │
+│      └─ governed_request() — single choke point              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Job Lifecycle (Governed)
+
+1. API receives a Proposal and mints a JobSpec only after governance decisions.
+2. API computes and pins:
+   - `manifest_hash`
+   - `deployment_envelope`
+   - `envelope_hash` (DEH)
+3. Runner consumes the JobSpec and enforces:
+   - Manifest drift refusal (`manifest_hash` must match runner manifest)
+   - DEH verification (recompute and compare)
+   - Autonomy Budget gates (preemptive)
+   - Artifact-backed completion enforcement
+4. Runner reports bounded, sanitized results including governance evidence.
+
+### Machine-Verifiable Evidence
+
+Runner results include:
+- `deh_evidence`:
+  - `envelope_hash_verified` (bool)
+  - `deh_claimed`
+  - `deh_recomputed`
+- `autonomy_budget` + `autonomy_usage`
+- `completion_artifacts` (verifiable hashes)
+
+---
+
 ## Extending the System
 
 ### Adding a New Agent

@@ -9,6 +9,32 @@ Intent → Proposal → Decision → Job → Execution
       (propose)            (execute)
 ```
 
+## Governance Hardening (V1)
+
+This repo implements a fail-closed governance perimeter for all executable agent work via a hardened Runner.
+
+### Runner Governance Stack
+
+1. **Capability Declaration**
+   - Deployment Envelope included in every job
+   - **DEH (Deployment Envelope Hash)** computed at mint time
+   - Runner recomputes DEH independently and rejects mismatches
+
+2. **Rate & Blast-Radius Control**
+   - **Autonomy Budget** enforced preemptively (steps, tool calls, runtime, external I/O)
+   - Write-scope gating (`none < sandbox < staging < prod`)
+
+3. **Egress Hard-Stop**
+   - `governed_request()` is the **single choke point** for any tool network access
+   - All external I/O is metered via `max_external_io` and runtime checks
+
+### Result Integrity
+
+- **Artifact-backed completion**: Runner must not report "completed" without verifiable artifacts
+- **Machine-verifiable receipts**: Results include `deh_evidence` (claimed vs recomputed hash + verified flag)
+
+---
+
 ## What This Is
 
 M87 is a governed agent execution platform where:

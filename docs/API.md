@@ -591,6 +591,92 @@ Proposal Submitted
 }
 ```
 
+## Runner Result Contract (V1 Governance)
+
+Runner posts job completion to the API using the hardened result contract.
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `job_id` | string | Job identifier |
+| `proposal_id` | string | Related proposal |
+| `status` | string | `completed`, `failed`, or `manifest_reject` |
+| `output` | object | Execution output (sanitized, capped) |
+| `manifest_hash` | string | Runner's manifest hash |
+| `manifest_version` | string | Manifest version |
+| `completion_artifacts` | object | Verifiable artifacts: `files`, `diffs`, `logs`, `receipts` |
+| `envelope_hash` | string | DEH pinned at job mint time |
+| `autonomy_budget` | object | Immutable budget snapshot applied by runner |
+| `autonomy_usage` | object | Counters consumed during execution |
+| `deh_evidence` | object | Machine-verifiable DEH proof |
+
+### DEH Evidence Structure
+
+```json
+{
+  "envelope_hash_verified": true,
+  "deh_claimed": "abc123...",
+  "deh_recomputed": "abc123...",
+  "error": null
+}
+```
+
+---
+
+## Shadow Eval (V1)
+
+### POST /v1/shadow-eval/trigger
+
+Triggers a shadow evaluation run (admin-only). Current implementation is a stub with telemetry.
+
+**Authentication:** Required (`admin:shadow-eval` scope)
+
+**Request Body:**
+
+```json
+{
+  "reason": "interval",
+  "job_id": "j-xxx",
+  "envelope_hash": "abc123..."
+}
+```
+
+**Response:**
+
+```json
+{
+  "eval_id": "eval-xxx",
+  "envelope_hash": "abc123...",
+  "eval_suite_hash": "000...",
+  "drift_score": 0.0,
+  "passed": true,
+  "details": {},
+  "run_at": "2024-01-01T00:00:00Z"
+}
+```
+
+### GET /v1/shadow-eval/status
+
+Returns shadow evaluation state and recent history.
+
+**Authentication:** Required (`admin:shadow-eval` scope)
+
+**Response:**
+
+```json
+{
+  "jobs_since_last_eval": 42,
+  "last_eval_at": "2024-01-01T00:00:00Z",
+  "last_drift_score": 0.0,
+  "trigger_interval": 100,
+  "drift_threshold": 0.1,
+  "recent_evals": []
+}
+```
+
+---
+
 ## Rate Limits
 
 Currently no rate limits are enforced. For production deployments, consider adding rate limiting at the reverse proxy level.

@@ -45,3 +45,41 @@ TOOL_ALLOWLIST = {"echo", "pytest", "git", "build"}
 - Timeout exceeded → kill, emit job.failed
 - Exit code != 0 → emit job.failed with stderr
 - Success → emit job.completed with stdout
+
+---
+
+## V1 Governance Rules (Runner)
+
+### Tool Development
+
+- Never introduce a new tool without:
+  - Manifest entry with declared effects
+  - Write-scope requirements
+  - Artifact-backed completion support (or explicit failure)
+
+### Network Egress
+
+- Never add direct `requests.*` calls in tools
+- All network egress must use `governed_request(tracker, ...)`
+- External I/O is metered via `max_external_io` budget
+
+### Governance Evidence
+
+- Any governance check failure must be fail-closed with structured evidence
+- Include `deh_evidence` when possible
+- Include `autonomy_budget` and `autonomy_usage` in results
+- Keep result payload bounded and JSON-serializable
+
+### Preemptive Enforcement
+
+Runner enforces Autonomy Budget preemptively:
+- `try_step()` before each step
+- `try_tool_call()` before tool dispatch
+- `runtime_exceeded()` at multiple checkpoints
+- `scope_rank()` for write-scope gating
+
+### Defense-in-Depth
+
+- Runner recomputes DEH independently (does not trust API)
+- Open-weight models clamped to `safe_default` + `sandbox` write scope
+- Artifact-backed completion: no "completed" without verifiable artifacts

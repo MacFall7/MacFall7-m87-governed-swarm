@@ -440,6 +440,30 @@ docker compose -f infra/docker-compose.yml up -d
 curl -s http://localhost:8000/openapi.json | jq '.paths | keys'
 ```
 
+## Governance Guidelines (Do Not Bypass)
+
+### 1. Tool effects are contracts
+
+All tool behavior must be declared in the tool manifest. The Runner does not guess.
+
+### 2. Fail-closed defaults
+
+Missing governance fields (manifest hash, envelope hash, envelope) must result in refusal, not fallback execution.
+
+### 3. All network I/O must go through `governed_request()`
+
+Do not call `requests.*` directly inside tools. External I/O must be metered via Autonomy Budget.
+
+### 4. Completed requires artifacts
+
+Tools must return verifiable completion artifacts. The runner will force failure if a tool "succeeds" without artifacts.
+
+### 5. Defense-in-depth
+
+Runner must independently clamp risky configurations (e.g., open-weight models forced to `safe_default` + sandbox write scope).
+
+---
+
 ## Contributing
 
 1. Fork the repository
