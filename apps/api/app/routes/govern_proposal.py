@@ -9,6 +9,9 @@ Wire order (fail-closed at each stage):
 
 All enforcement happens in the Runner—the only component authorized to
 execute tools—so policy can't be bypassed by upstream orchestration.
+
+This module also exports helper functions that /v1 endpoints can use
+to delegate into the Phase 3-6 enforcement lane (no bypass).
 """
 from __future__ import annotations
 
@@ -89,35 +92,34 @@ def get_redis() -> redis.Redis:
     return redis.Redis.from_url(redis_url, decode_responses=False)
 
 
-# ---- Routes ----
+# ---- Pure Helper Functions (for /v1 delegation) ----
+# These can be called from legacy endpoints to enforce Phase 3-6 governance.
 
-@router.post("/proposal", response_model=GovernanceResponse)
-def govern_proposal(
-    payload: ProposalRequest,
-    r: redis.Redis = Depends(get_redis)
-) -> GovernanceResponse:
+def evaluate_governance_proposal(payload: Dict[str, Any], r: redis.Redis) -> Dict[str, Any]:
     """
-    Main governance choke point.
+    Core governance evaluation logic.
 
-    Evaluates proposal against:
-    1. Session risk (cumulative toxic topology detection)
-    2. Code artifact tripwire scan
-    3. Returns challenge if REQUIRE_HUMAN
+    Can be called from /v1 or /v2 endpoints.
+    Returns dict with: decision, reason, challenge (if REQUIRE_HUMAN), proposal_hash
     """
+    principal_id = payload.get("principal_id") or "unknown"
+    agent_name = payload.get("agent_name") or payload.get("agent") or "unknown"
+    proposed_effects = payload.get("effects") or []
+    artifacts = payload.get("artifacts") or []
+
     tracker = SessionRiskTracker(r=r)
 
     # Phase 3: Evaluate against session history (toxic topologies)
-    decision, reason = tracker.evaluate(
-        payload.principal_id,
-        payload.agent_name,
-        payload.effects
-    )
+    decision, reason = tracker.evaluate(principal_id, agent_name, proposed_effects)
 
     # Phase 4/5: Inspect code artifacts BEFORE allowing execution paths
     tripwire_flags: List[str] = []
-    for artifact in payload.artifacts:
-        if artifact.type in ("python_code", "code", "shell_script"):
-            code = artifact.content or ""
+    for artifact in artifacts:
+        artifact_type = artifact.get("type") if isinstance(artifact, dict) else getattr(artifact, "type", None)
+        artifact_content = artifact.get("content") if isinstance(artifact, dict) else getattr(artifact, "content", None)
+
+        if artifact_type in ("python_code", "code", "shell_script"):
+            code = artifact_content or ""
             try:
                 scan = bounded_python_tripwire_scan(code)
             except GovernanceTimeout:
@@ -140,12 +142,13 @@ def govern_proposal(
         reason = f"{reason} | Tripwire flags: {tripwire_flags}"
 
     # Compute stable proposal hash for challenge binding
-    proposal_json = json.dumps(payload.model_dump(), sort_keys=True, default=str)
+    proposal_json = payload.get("_proposal_json")
+    if not isinstance(proposal_json, str):
+        proposal_json = json.dumps(payload, sort_keys=True, default=str)
     p_hash = stable_proposal_hash(proposal_json)
 
     # Phase 6: Challenge-response for REQUIRE_HUMAN
     if decision == "REQUIRE_HUMAN":
-        # Extract topology name from reason if present
         topology_name = "unknown_topology"
         if "Toxic topology detected:" in reason:
             try:
@@ -154,75 +157,70 @@ def govern_proposal(
                 pass
 
         challenge = generate_challenge(p_hash, topology_name)
-        return GovernanceResponse(
-            decision=decision,
-            reason=reason,
-            proposal_hash=p_hash,
-            challenge=ChallengeResponse(
-                challenge_id=challenge.challenge_id,
-                proposal_hash=challenge.proposal_hash,
-                prompt=challenge.prompt,
-            ),
-        )
+        return {
+            "decision": decision,
+            "reason": reason,
+            "proposal_hash": p_hash,
+            "challenge": {
+                "challenge_id": challenge.challenge_id,
+                "proposal_hash": challenge.proposal_hash,
+                "prompt": challenge.prompt,
+            },
+        }
 
     if decision == "DENY":
-        return GovernanceResponse(
-            decision=decision,
-            reason=reason,
-            proposal_hash=p_hash,
-        )
+        return {"decision": decision, "reason": reason, "proposal_hash": p_hash}
 
     # ALLOW: commit effects only now
     try:
-        tracker.commit(payload.principal_id, payload.agent_name, payload.effects)
-    except Exception as e:
-        # Commit failure should fail-closed
+        tracker.commit(principal_id, agent_name, proposed_effects)
+    except Exception:
         raise HTTPException(
             status_code=503,
-            detail=f"Failed to persist governance state (Redis): {str(e)}"
+            detail="Failed to persist governance state (Redis)."
         )
 
-    return GovernanceResponse(
-        decision="ALLOW",
-        reason=reason,
-        proposal_hash=p_hash,
-    )
+    return {"decision": "ALLOW", "reason": reason, "proposal_hash": p_hash}
 
 
-@router.post("/approve", response_model=GovernanceResponse)
-def approve_override(
-    payload: ApprovalRequest,
-    r: redis.Redis = Depends(get_redis)
-) -> GovernanceResponse:
+def approve_governance_override(payload: Dict[str, Any], r: redis.Redis) -> Dict[str, Any]:
     """
-    Human override approval with challenge-response verification.
+    Core human override approval logic.
 
-    Requires:
-    1. Valid challenge response (proves human read the warning)
-    2. Challenge binding to original proposal (prevents bait-switch)
+    Can be called from /v1 or /v2 endpoints.
+    Verifies challenge-response and commits effects on success.
     """
-    # Recompute proposal hash
-    proposal_json = json.dumps(payload.proposal, sort_keys=True, default=str)
+    principal_id = payload.get("principal_id") or "unknown"
+    agent_name = payload.get("agent_name") or payload.get("agent") or "unknown"
+    effects = payload.get("effects") or []
+    answer = payload.get("answer") or ""
+    challenge_id = payload.get("challenge_id") or ""
+
+    # Get proposal JSON for hash binding
+    proposal_json = payload.get("_proposal_json")
+    if not isinstance(proposal_json, str):
+        proposal_json = json.dumps(payload.get("proposal") or {}, sort_keys=True, default=str)
     p_hash = stable_proposal_hash(proposal_json)
 
-    # Extract topology from effects or use generic
+    # Extract topology from proposal reason if present
     topology_name = "unknown_topology"
-    if "Toxic topology" in str(payload.proposal.get("reason", "")):
+    proposal = payload.get("proposal") or {}
+    if "Toxic topology" in str(proposal.get("reason", "")):
         try:
-            topology_name = str(payload.proposal["reason"]).split("Toxic topology detected:")[1].strip().split()[0]
+            topology_name = str(proposal["reason"]).split("Toxic topology detected:")[1].strip().split()[0]
         except Exception:
             pass
 
     # Recreate challenge for verification
     ch = Challenge(
-        challenge_id=payload.challenge_id,
-        prompt="",  # Not needed for verification
+        challenge_id=challenge_id,
+        prompt="",
         expected=topology_name,
         proposal_hash=p_hash,
     )
 
     # Verify the challenge
-    result = verify_challenge(ch, payload.answer)
+    result = verify_challenge(ch, answer)
     if result.get("ok") != "true":
         raise HTTPException(
             status_code=403,
@@ -232,15 +230,70 @@ def approve_override(
     # Commit effects after successful verification
     tracker = SessionRiskTracker(r=r)
     try:
-        tracker.commit(payload.principal_id, payload.agent_name, payload.effects)
-    except Exception as e:
+        tracker.commit(principal_id, agent_name, effects)
+    except Exception:
         raise HTTPException(
             status_code=503,
-            detail=f"Failed to persist governance state (Redis): {str(e)}"
+            detail="Failed to persist governance state (Redis)."
         )
 
+    return {"decision": "ALLOW", "reason": "Human override approved with challenge-response", "proposal_hash": p_hash}
+
+
+# ---- Routes (v2) ----
+
+@router.post("/proposal", response_model=GovernanceResponse)
+def govern_proposal(
+    payload: ProposalRequest,
+    r: redis.Redis = Depends(get_redis)
+) -> GovernanceResponse:
+    """
+    Main governance choke point (v2).
+
+    Evaluates proposal against:
+    1. Session risk (cumulative toxic topology detection)
+    2. Code artifact tripwire scan
+    3. Returns challenge if REQUIRE_HUMAN
+    """
+    # Convert Pydantic model to dict for helper
+    payload_dict = payload.model_dump()
+    payload_dict["_proposal_json"] = payload.model_dump_json()
+
+    result = evaluate_governance_proposal(payload_dict, r)
+
+    # Convert result to response model
+    challenge = None
+    if result.get("challenge"):
+        challenge = ChallengeResponse(**result["challenge"])
+
     return GovernanceResponse(
-        decision="ALLOW",
-        reason="Human override approved with challenge-response",
-        proposal_hash=p_hash,
+        decision=result["decision"],
+        reason=result["reason"],
+        proposal_hash=result.get("proposal_hash"),
+        challenge=challenge,
+    )
+
+
+@router.post("/approve", response_model=GovernanceResponse)
+def approve_override(
+    payload: ApprovalRequest,
+    r: redis.Redis = Depends(get_redis)
+) -> GovernanceResponse:
+    """
+    Human override approval with challenge-response verification (v2).
+
+    Requires:
+    1. Valid challenge response (proves human read the warning)
+    2. Challenge binding to original proposal (prevents bait-switch)
+    """
+    # Convert Pydantic model to dict for helper
+    payload_dict = payload.model_dump()
+    payload_dict["_proposal_json"] = json.dumps(payload.proposal, sort_keys=True, default=str)
+
+    result = approve_governance_override(payload_dict, r)
+
+    return GovernanceResponse(
+        decision=result["decision"],
+        reason=result["reason"],
+        proposal_hash=result.get("proposal_hash"),
     )

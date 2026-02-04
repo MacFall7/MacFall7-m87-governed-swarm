@@ -35,6 +35,7 @@ from .db import (
 
 # V1 Governance: Phase 3-6 unified governance route
 from .routes.govern_proposal import router as govern_router
+from .routes.govern_proposal import evaluate_governance_proposal
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1087,7 +1088,74 @@ def govern_proposal(
         })
         return decision
 
-    # Rule 5: ALLOW - mint job immediately
+    # Rule 5: ALLOW - but first check Phase 3-6 governance (no bypass)
+    # V1.1: Delegate to Phase 3-6 SessionRiskTracker for toxic topology detection
+    phase36_payload = {
+        "principal_id": auth.principal_id,
+        "agent_name": agent,
+        "effects": list(proposal.effects),
+        "artifacts": proposal.artifacts or [],
+        "_proposal_json": proposal.model_dump_json() if hasattr(proposal, "model_dump_json") else json.dumps(proposal.model_dump()),
+    }
+
+    # Check kill-switch: if disabled, skip Phase 3-6 (for emergency rollback only)
+    if os.environ.get("M87_DISABLE_PHASE36_GOVERNANCE", "0") != "1":
+        phase36_result = evaluate_governance_proposal(phase36_payload, rdb)
+
+        if phase36_result.get("decision") == "DENY":
+            reasons.append(f"Phase 3-6 governance: {phase36_result.get('reason')}")
+            decision = GovernanceDecision(
+                proposal_id=proposal.proposal_id,
+                decision="DENY",
+                reasons=reasons,
+            )
+            persist_decision(
+                proposal_id=proposal.proposal_id,
+                outcome="DENY",
+                reasons=reasons,
+                decided_by="policy:phase36",
+            )
+            emit("proposal.denied", {
+                **decision.model_dump(),
+                "agent": agent,
+                "principal_id": auth.principal_id,
+                "phase36_reason": phase36_result.get("reason"),
+            })
+            return decision
+
+        if phase36_result.get("decision") == "REQUIRE_HUMAN":
+            reasons.append(f"Phase 3-6 governance: {phase36_result.get('reason')}")
+            decision = GovernanceDecision(
+                proposal_id=proposal.proposal_id,
+                decision="REQUIRE_HUMAN",
+                reasons=reasons,
+                required_approvals=["mac"],
+                allowed_effects=proposal.effects,
+            )
+            persist_decision(
+                proposal_id=proposal.proposal_id,
+                outcome="REQUIRE_HUMAN",
+                reasons=reasons,
+                decided_by="policy:phase36",
+                required_approvals=["mac"],
+                allowed_effects=list(proposal.effects),
+            )
+            emit("proposal.needs_approval", {
+                **decision.model_dump(),
+                "summary": proposal.summary,
+                "agent": agent,
+                "principal_id": auth.principal_id,
+                "phase36_reason": phase36_result.get("reason"),
+                "challenge": phase36_result.get("challenge"),
+            })
+            rdb.hset(f"m87:pending:{proposal.proposal_id}", mapping={
+                "proposal": json.dumps(proposal.model_dump()),
+                "decision": json.dumps(decision.model_dump()),
+                "phase36_challenge": json.dumps(phase36_result.get("challenge") or {}),
+            })
+            return decision
+
+    # Phase 3-6 passed (or disabled) - proceed with ALLOW
     reasons.append(f"Allowed by policy. Agent '{agent}' within scope.")
     decision = GovernanceDecision(
         proposal_id=proposal.proposal_id,
@@ -1135,9 +1203,22 @@ def govern_proposal(
     )
 
 
+class ApproveRequest(BaseModel):
+    """Request body for /v1/approve (optional for backward compatibility)."""
+    challenge_answer: Optional[str] = None  # Required if proposal has phase36_challenge
+
+
 @app.post("/v1/approve/{proposal_id}")
-def approve(proposal_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
-    """Human approves a pending proposal. Requires proposal:approve scope."""
+def approve(
+    proposal_id: str,
+    body: Optional[ApproveRequest] = None,
+    x_m87_key: Optional[str] = Header(None, alias="X-M87-Key"),
+):
+    """
+    Human approves a pending proposal. Requires proposal:approve scope.
+
+    V1.1: If proposal was escalated by Phase 3-6, requires challenge_answer.
+    """
     # Phase 2: Hard fail-safe
     require_persistence()
 
@@ -1149,13 +1230,64 @@ def approve(proposal_id: str, x_m87_key: Optional[str] = Header(None, alias="X-M
     if not pending_data:
         raise HTTPException(status_code=404, detail="No pending proposal found")
 
-    proposal_data = json.loads(pending_data.get("proposal", "{}"))
+    # Decode Redis data (may be bytes)
+    def decode_redis(val):
+        if isinstance(val, bytes):
+            return val.decode("utf-8")
+        return val
+
+    proposal_json = decode_redis(pending_data.get("proposal", b"{}"))
+    phase36_challenge_json = decode_redis(pending_data.get("phase36_challenge", b"{}"))
+
+    proposal_data = json.loads(proposal_json)
+    phase36_challenge = json.loads(phase36_challenge_json)
+
+    # V1.1: If Phase 3-6 challenge exists, verify it
+    if phase36_challenge and phase36_challenge.get("challenge_id"):
+        if not body or not body.challenge_answer:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "CHALLENGE_REQUIRED",
+                    "message": "This proposal requires challenge-response verification",
+                    "challenge": phase36_challenge,
+                }
+            )
+
+        # Verify challenge using the Phase 3-6 helper
+        from .governance.adversarial_review import stable_proposal_hash, generate_challenge, verify_challenge, Challenge
+
+        p_hash = stable_proposal_hash(proposal_json)
+
+        # Extract topology from challenge or use generic
+        topology_name = "unknown_topology"
+        decision_data = json.loads(decode_redis(pending_data.get("decision", b"{}")))
+        reason = " ".join(decision_data.get("reasons", []))
+        if "Toxic topology detected:" in reason:
+            try:
+                topology_name = reason.split("Toxic topology detected:")[1].strip().split()[0]
+            except Exception:
+                pass
+
+        ch = Challenge(
+            challenge_id=phase36_challenge.get("challenge_id"),
+            prompt="",
+            expected=topology_name,
+            proposal_hash=p_hash,
+        )
+
+        result = verify_challenge(ch, body.challenge_answer)
+        if result.get("ok") != "true":
+            raise HTTPException(
+                status_code=403,
+                detail=f"Challenge verification failed: {result.get('reason')}"
+            )
 
     # Phase 2: Persist human approval decision
     persist_decision(
         proposal_id=proposal_id,
         outcome="ALLOW",
-        reasons=["Human approved"],
+        reasons=["Human approved (challenge verified)" if phase36_challenge else "Human approved"],
         decided_by=f"human:{auth.principal_id}",
     )
 
