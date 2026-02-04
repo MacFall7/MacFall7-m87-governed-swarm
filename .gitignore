@@ -12,3 +12,5 @@ dist/
 # Runtime
 *.log
 data/
+.coverage
+htmlcov/
