@@ -531,6 +531,8 @@ class RunnerResult(BaseModel):
     completion_artifacts: Optional[CompletionArtifacts] = None
     envelope_hash: Optional[str] = Field(None, min_length=64, max_length=64)
     autonomy_usage: Optional[Dict[str, Any]] = None
+    # V1 Governance: DEH verification evidence (machine-verifiable proof)
+    deh_evidence: Optional[Dict[str, Any]] = None
 
 
 class CreateKeyRequest(BaseModel):
@@ -580,9 +582,20 @@ class DeploymentEnvelope(BaseModel):
 
 
 def compute_deployment_envelope_hash(envelope: DeploymentEnvelope) -> str:
-    """Compute DEH = SHA256(canonical_json(deployment_envelope))"""
-    # Canonical JSON: sorted keys, no extra whitespace
-    canonical = json.dumps(envelope.model_dump(), sort_keys=True, separators=(',', ':'))
+    """
+    Compute DEH = SHA256(canonical_json(deployment_envelope))
+
+    Canonicalization rules (MUST match runner):
+    - mode="json" ensures JSON-serializable types
+    - exclude_none=True prevents None field mismatches
+    - sort_keys=True for deterministic ordering
+    - separators=(',', ':') removes whitespace
+    """
+    canonical = json.dumps(
+        envelope.model_dump(mode="json", exclude_none=True),
+        sort_keys=True,
+        separators=(',', ':'),
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -1337,6 +1350,7 @@ def runner_result(result: RunnerResult, x_m87_key: Optional[str] = Header(None, 
         "envelope_hash": result.envelope_hash,
         "autonomy_usage": result.autonomy_usage,
         "has_artifacts": result.completion_artifacts.has_artifacts() if result.completion_artifacts else False,
+        "deh_evidence": result.deh_evidence,  # Machine-verifiable DEH proof from runner
         "received_at": datetime.utcnow().isoformat() + "Z",
     }
 

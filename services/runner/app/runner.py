@@ -32,31 +32,95 @@ MAX_REPORT_BYTES = int(os.getenv("M87_MAX_RUNNER_RESULT_BYTES", "65536"))
 
 
 # ---- V1 Governance: Deployment Envelope Hash verification
+def _exclude_none_recursive(obj: Any) -> Any:
+    """Recursively remove None values from dict (matches API exclude_none=True)."""
+    if isinstance(obj, dict):
+        return {k: _exclude_none_recursive(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_exclude_none_recursive(x) for x in obj]
+    return obj
+
+
 def compute_envelope_hash(envelope: Dict[str, Any]) -> str:
-    """Compute DEH = SHA256(canonical_json(deployment_envelope))"""
-    canonical = json.dumps(envelope, sort_keys=True, separators=(',', ':'))
+    """
+    Compute DEH = SHA256(canonical_json(deployment_envelope))
+
+    Canonicalization rules (MUST match API):
+    - exclude_none removes None fields
+    - sort_keys=True for deterministic ordering
+    - separators=(',', ':') removes whitespace
+    """
+    clean_envelope = _exclude_none_recursive(envelope)
+    canonical = json.dumps(clean_envelope, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def verify_deployment_envelope(job: Dict[str, Any]) -> Optional[str]:
+def verify_deployment_envelope(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     Verify job's deployment envelope hash matches recomputed hash.
-    Returns error string if mismatch, None if OK.
+    Returns evidence dict with verification result.
+
+    Defense-in-depth: Runner independently verifies, doesn't trust API.
     """
     envelope = job.get("deployment_envelope")
     claimed_hash = job.get("envelope_hash")
 
+    evidence = {
+        "envelope_hash_verified": False,
+        "deh_claimed": claimed_hash,
+        "deh_recomputed": None,
+        "error": None,
+    }
+
     if not claimed_hash:
-        return "Job missing envelope_hash (pre-V1.0 API?)"
+        evidence["error"] = "Job missing envelope_hash (pre-V1.0 API?)"
+        return evidence
 
     if not envelope:
-        return "Job missing deployment_envelope for verification"
+        evidence["error"] = "Job missing deployment_envelope for verification"
+        return evidence
 
     recomputed = compute_envelope_hash(envelope)
-    if recomputed != claimed_hash:
-        return f"DEH mismatch: claimed {claimed_hash[:16]}... but computed {recomputed[:16]}..."
+    evidence["deh_recomputed"] = recomputed
 
-    return None
+    if recomputed != claimed_hash:
+        evidence["error"] = f"DEH mismatch: claimed {claimed_hash[:16]}... but computed {recomputed[:16]}..."
+        return evidence
+
+    evidence["envelope_hash_verified"] = True
+    return evidence
+
+
+def enforce_open_weight_safety(envelope: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Defense-in-depth: Runner clamps open-weight models to safe defaults.
+    Returns modified envelope (does not mutate input).
+    """
+    if envelope.get("model_source") != "open":
+        return envelope
+
+    # Force safe_default for open-weight models
+    clamped = dict(envelope)
+    if clamped.get("safety_mode") != "safe_default":
+        print(f"  ⚠ Clamping open-weight model to safe_default (was: {clamped.get('safety_mode')})", flush=True)
+        clamped["safety_mode"] = "safe_default"
+
+    # Clamp autonomy budget for open-weight models
+    budget = dict(clamped.get("autonomy_budget", {}))
+    OPEN_WEIGHT_MAX_STEPS = 50
+    OPEN_WEIGHT_MAX_TOOL_CALLS = 25
+    OPEN_WEIGHT_MAX_RUNTIME = 120
+
+    if budget.get("max_steps", 0) > OPEN_WEIGHT_MAX_STEPS:
+        print(f"  ⚠ Clamping open-weight max_steps: {budget['max_steps']} → {OPEN_WEIGHT_MAX_STEPS}", flush=True)
+        budget["max_steps"] = OPEN_WEIGHT_MAX_STEPS
+    if budget.get("max_tool_calls", 0) > OPEN_WEIGHT_MAX_TOOL_CALLS:
+        budget["max_tool_calls"] = OPEN_WEIGHT_MAX_TOOL_CALLS
+    if budget.get("max_runtime_seconds", 0) > OPEN_WEIGHT_MAX_RUNTIME:
+        budget["max_runtime_seconds"] = OPEN_WEIGHT_MAX_RUNTIME
+
+    clamped["autonomy_budget"] = budget
+    return clamped
 
 
 # ---- V1 Governance: Autonomy Budget tracking
@@ -289,8 +353,10 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
     """
     Execute job with governance controls:
     - Manifest hash drift refusal
-    - Deployment Envelope Hash (DEH) verification
+    - Deployment Envelope Hash (DEH) verification with evidence
+    - Open-weight safety clamping
     - Autonomy Budget enforcement
+    - Artifact-backed completion enforcement
     """
     job_id = job.get("job_id", "unknown")
 
@@ -314,27 +380,33 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
             "exit_code": -1,
         }
 
-    # V1 Governance: Deployment Envelope Hash verification
-    deh_error = verify_deployment_envelope(job)
-    if deh_error:
-        print(f"  ✗ DEH verification failed: {deh_error}", flush=True)
+    # V1 Governance: Deployment Envelope Hash verification (returns evidence)
+    deh_evidence = verify_deployment_envelope(job)
+    if not deh_evidence.get("envelope_hash_verified"):
+        print(f"  ✗ DEH verification failed: {deh_evidence.get('error')}", flush=True)
         return {
             "error": "deh_verification_failed",
-            "detail": deh_error,
+            "detail": deh_evidence.get("error"),
+            "deh_evidence": deh_evidence,
             "exit_code": -1,
         }
 
-    # V1 Governance: Initialize autonomy budget tracker
-    budget = job.get("autonomy_budget", {})
+    # V1 Governance: Defense-in-depth open-weight clamping
+    envelope = job.get("deployment_envelope", {})
+    clamped_envelope = enforce_open_weight_safety(envelope)
+    budget = clamped_envelope.get("autonomy_budget", {})
+
+    # V1 Governance: Initialize autonomy budget tracker with clamped values
     tracker = AutonomyBudgetTracker(budget)
 
-    # Check budget before execution
+    # Check budget BEFORE execution (pre-call check)
     budget_error = tracker.check_limits()
     if budget_error:
         return {
             "error": "autonomy_budget_exceeded",
             "detail": budget_error,
             "usage": tracker.get_usage(),
+            "deh_evidence": deh_evidence,
             "exit_code": -1,
         }
 
@@ -343,17 +415,18 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
     tool_spec = manifest.get("tools", {}).get(tool, {})
     timeout_seconds = int(tool_spec.get("timeout_seconds", 30))
 
-    # Track tool call
+    # Track tool call BEFORE execution
     tracker.increment_tool_call()
     tracker.increment_step()
 
-    # Check budget after incrementing
+    # Check budget AFTER incrementing (catches budget exhausted by this call)
     budget_error = tracker.check_limits()
     if budget_error:
         return {
             "error": "autonomy_budget_exceeded",
             "detail": budget_error,
             "usage": tracker.get_usage(),
+            "deh_evidence": deh_evidence,
             "exit_code": -1,
         }
 
@@ -365,9 +438,22 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
         # Should never happen due to manifest validation
         raise RuntimeError(f"Unhandled tool: {tool}")
 
-    # Add usage telemetry to result
+    # V1 Governance: Artifact-backed completion enforcement (runner-side)
+    # Runner must not report "completed" without artifacts
+    has_error = result.get("error") or result.get("exit_code", 0) != 0
+    has_artifacts = bool(result.get("completion_artifacts"))
+
+    if not has_error and not has_artifacts:
+        # Tool ran successfully but didn't produce artifacts
+        # This is a tool implementation bug - force failure
+        print(f"  ⚠ Tool '{tool}' completed without artifacts - forcing failure", flush=True)
+        result["error"] = "no_verifiable_artifacts_for_tool"
+        result["exit_code"] = -1
+
+    # Add governance telemetry to result
     result["autonomy_usage"] = tracker.get_usage()
     result["envelope_hash"] = job.get("envelope_hash")
+    result["deh_evidence"] = deh_evidence  # Machine-verifiable proof
 
     return result
 
@@ -376,12 +462,13 @@ def report_result(job_id: str, proposal_id: str, status: str, output: Dict[str, 
     """
     Report result back to API with manifest metadata.
     Phase 5 Step 3: bounded payload.
-    V1 Governance: includes completion_artifacts, envelope_hash, autonomy_usage.
+    V1 Governance: includes completion_artifacts, envelope_hash, autonomy_usage, deh_evidence.
     """
     # Extract V1 governance fields from output (added by execute_job)
     completion_artifacts = output.pop("completion_artifacts", None)
     envelope_hash = output.pop("envelope_hash", None)
     autonomy_usage = output.pop("autonomy_usage", None)
+    deh_evidence = output.pop("deh_evidence", None)
 
     payload = {
         "job_id": job_id,
@@ -394,6 +481,7 @@ def report_result(job_id: str, proposal_id: str, status: str, output: Dict[str, 
         "completion_artifacts": completion_artifacts,
         "envelope_hash": envelope_hash,
         "autonomy_usage": autonomy_usage,
+        "deh_evidence": deh_evidence,  # Machine-verifiable DEH proof
     }
 
     # Phase 5 Step 3: Enforce byte size cap on outbound results
