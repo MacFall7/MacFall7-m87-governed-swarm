@@ -33,6 +33,9 @@ from .db import (
     delete_api_key as db_delete_key,
 )
 
+# V1 Governance: Phase 3-6 unified governance route
+from .routes.govern_proposal import router as govern_router
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -183,6 +186,9 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
+
+# ---- V1 Governance: Phase 3-6 unified governance route
+app.include_router(govern_router)
 
 # ---- Redis connection
 rdb = Redis.from_url(REDIS_URL, decode_responses=True)
