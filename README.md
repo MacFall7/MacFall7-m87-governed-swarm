@@ -114,6 +114,41 @@ This is not "AI agents doing whatever." This is **autonomy under explicit author
 | No scope → no proposal | Agents can't propose outside their effect scope |
 | No decision → no execution | Runner only executes approved decisions |
 
+## Fail-Closed Guarantees
+
+M87 is designed so that **ambiguity resolves to denial**, not permission.
+
+| Condition | Behavior |
+|-----------|----------|
+| Unknown effect tag | DENY |
+| Unknown reversibility class | DENY (Runner rejects) |
+| Missing deployment envelope | DENY (Runner rejects) |
+| DEH hash mismatch | DENY (Runner rejects) |
+| Manifest hash drift | DENY (Runner rejects) |
+| Budget field missing | Runner defaults applied (not infinite) |
+| Redis unavailable | API returns 503 (no silent bypass) |
+| Tool not in manifest | DENY (Runner rejects) |
+| Sensor blindness (Phase 3) | DENY for exfil-adjacent effects |
+
+**Why this matters**: In security-critical systems, "fail-open" creates exploitable gaps. M87 never assumes permission—it requires explicit proof of authorization at every layer.
+
+## What This System Will Not Do
+
+These are **anti-features**—capabilities deliberately excluded from M87:
+
+| Excluded Capability | Reason |
+|---------------------|--------|
+| Auto-approve based on agent confidence | Agents cannot escalate their own permissions |
+| Retry with relaxed constraints | Failure must not silently weaken policy |
+| Execute without governance decision | No "fast path" that bypasses approval |
+| Trust cached decisions indefinitely | Reconciliation re-validates on every load |
+| Allow READ_SECRETS under any condition | Hardcoded DENY, no override mechanism |
+| Permit IRREVERSIBLE without human | Human approval is non-negotiable for irreversible actions |
+| Fallback to permissive defaults | Unknown state = rejection, not assumption |
+| Skip artifact verification | Completion requires machine-verifiable proof |
+
+**This is not a limitation—it's the product**. M87 exists to make these behaviors impossible by construction.
+
 ## Quick Start
 
 ```bash
@@ -286,9 +321,10 @@ m87-governed-swarm/
 ## Documentation
 
 - [Installation Guide](docs/INSTALL.md) - Step-by-step setup
-- [Architecture](docs/ARCHITECTURE.md) - System design
+- [Architecture](docs/ARCHITECTURE.md) - System design + Governing Laws
 - [Developer Guide](docs/DEVELOPER.md) - Contributing and extending
 - [API Reference](docs/API.md) - Complete API documentation
+- [Proof Map](docs/PROOF_MAP.md) - Claim → Mechanism → Test mapping (for auditors)
 - [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues
 
 ## Verification

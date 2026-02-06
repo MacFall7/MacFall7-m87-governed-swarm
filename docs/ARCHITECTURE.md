@@ -2,6 +2,29 @@
 
 Deep dive into the M87 Governed Swarm system design.
 
+## Governing Laws
+
+These are the system's **inviolable constraints**. Each law maps directly to enforcement code and regression tests.
+
+| # | Law | Enforcement | Test File |
+|---|-----|-------------|-----------|
+| 1 | **Agents cannot execute tools** | Runner is the only component that calls subprocess | `proof-test.sh` (no tool calls outside runner) |
+| 2 | **No approval → no job** | `govern_proposal()` gates all job minting | `apps/api/tests/test_governance.py` |
+| 3 | **Unknown state → DENY** | All governance paths default to rejection | `apps/api/tests/test_governance.py::test_fail_closed_*` |
+| 4 | **DEH mismatch → reject** | Runner recomputes envelope hash independently | `services/runner/tests/test_runner.py::test_deh_*` |
+| 5 | **Manifest drift → refuse** | Runner compares job.manifest_hash to loaded hash | `services/runner/tests/test_runner.py::test_manifest_*` |
+| 6 | **Budget exhaustion → halt** | Preemptive `try_*` gates in AutonomyBudgetTracker | `services/runner/tests/test_runner.py::test_budget_*` |
+| 7 | **No artifacts → no completion** | Runner requires verifiable completion_artifacts | `services/runner/tests/test_runner.py::test_artifact_*` |
+| 8 | **IRREVERSIBLE → human approval** | Reversibility gate blocks without explicit approval | `apps/api/tests/test_governance.py::test_reversibility_*` |
+| 9 | **READ_SECRETS → always DENY** | Hardcoded rejection in govern_proposal() | `apps/api/tests/test_governance.py::test_secrets_denied` |
+| 10 | **Toxic topology → escalate** | SessionRiskTracker detects effect sequences | `apps/api/tests/test_governance.py::test_toxic_*` |
+
+**Audit trail**: Every law violation emits an event to `m87:events` with the specific law code and rejection reason.
+
+**No exceptions**: These laws cannot be relaxed by configuration, environment variables, or runtime flags (except documented emergency kill-switches that log loudly).
+
+---
+
 ## Design Philosophy
 
 M87 is built on one principle: **autonomy requires governance**.

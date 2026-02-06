@@ -61,6 +61,13 @@ def verify_deployment_envelope(job: Dict[str, Any]) -> Dict[str, Any]:
     Returns evidence dict with verification result.
 
     Defense-in-depth: Runner independently verifies, doesn't trust API.
+
+    INTENT PRESERVATION:
+    - Rejection is safer than fallback: A mismatched hash could mean the API
+      was compromised or the job was tampered with in transit. Accepting it
+      "just this once" would defeat the entire integrity guarantee.
+    - No partial trust: Either the hash verifies completely or the job is rejected.
+      There is no "close enough" for cryptographic verification.
     """
     envelope = job.get("deployment_envelope")
     claimed_hash = job.get("envelope_hash")
@@ -243,6 +250,14 @@ def verify_reversibility_gate(job: Dict[str, Any], tool: str) -> Dict[str, Any]:
     - If reversibility_class is set, we verify it's valid and properly authorized.
     - Unknown reversibility_class values are rejected (fail-closed).
 
+    INTENT PRESERVATION:
+    - IRREVERSIBLE actions halt without human approval because the damage cannot
+      be undone. No automation should make permanent decisions autonomously.
+    - Unknown reversibility classes are rejected because an attacker could inject
+      a new class like "SUPER_SAFE" hoping the runner treats unknown as permissive.
+    - This gate exists at the runner (not just API) because the runner is the
+      last line of defense—if the API is compromised, the runner still blocks.
+
     Returns evidence dict with verification result.
     """
     evidence = {
@@ -340,6 +355,16 @@ def governed_request(
 
 
 # ---- V1 Governance: Autonomy Budget tracking
+#
+# INTENT PRESERVATION:
+# - Budgets are PREEMPTIVE, not reactive. We check BEFORE consuming resources,
+#   not after. This prevents "one more request" attacks that incrementally
+#   exhaust limits while claiming each individual request was small.
+# - Missing budget fields use runner defaults, NOT infinite. An attacker cannot
+#   bypass limits by omitting fields from the deployment envelope.
+# - Budget exhaustion halts execution immediately. There is no "finish current
+#   operation" grace period that could be exploited for last-ditch exfiltration.
+
 class AutonomyBudgetTracker:
     """
     Tracks resource usage against autonomy budget limits.
@@ -597,6 +622,16 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
     job_id = job.get("job_id", "unknown")
 
     # Phase 5 Step 2: Manifest hash drift refusal
+    #
+    # INTENT PRESERVATION:
+    # - Drift is fatal because the manifest defines what tools exist and their
+    #   constraints. A job pinned to an old manifest might reference tools that
+    #   no longer exist, or expect different input validation rules.
+    # - We reject rather than "upgrade" the job because automatic upgrades could
+    #   change security-relevant behavior (e.g., stricter input limits might
+    #   truncate data, looser limits might allow injection).
+    # - This prevents supply-chain attacks where an attacker modifies the manifest
+    #   after jobs were approved but before they execute.
     job_hash = job.get("manifest_hash")
     runner_hash = manifest.get("_manifest_hash")
 
@@ -742,6 +777,14 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
 
     # V1 Governance: Artifact-backed completion enforcement (runner-side)
     # Runner must not report "completed" without artifacts
+    #
+    # INTENT PRESERVATION:
+    # - "Completed" without proof is indistinguishable from "lied about completing".
+    #   Artifacts provide machine-verifiable evidence that work actually happened.
+    # - This prevents a compromised tool from claiming success without doing anything,
+    #   which could mask failures or allow attackers to skip security-critical steps.
+    # - Empty artifacts ({}) are rejected because they provide no verification value.
+    #   At minimum, a log or receipt must exist to prove the tool ran.
     has_error = result.get("error") or result.get("exit_code", 0) != 0
 
     # Strict artifact check: at least one list must have entries
