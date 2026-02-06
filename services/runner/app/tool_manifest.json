@@ -1,10 +1,11 @@
 {
-  "version": "1.0",
+  "version": "1.1",
   "tools": {
     "echo": {
       "description": "Safe no-op / heartbeat tool. Echoes a message.",
       "effects": ["SEND_NOTIFICATION"],
       "requires_human": false,
+      "supports_modes": ["commit", "draft", "preview"],
       "inputs": {
         "required": ["message"],
         "optional": [],
@@ -19,6 +20,7 @@
       "description": "Run test suite inside the runner container.",
       "effects": ["RUN_TESTS"],
       "requires_human": false,
+      "supports_modes": ["commit"],
       "inputs": {
         "required": ["args"],
         "optional": [],

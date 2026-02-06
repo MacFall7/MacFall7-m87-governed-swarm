@@ -194,6 +194,41 @@ VALID_REVERSIBILITY_CLASSES = {
     REVERSIBILITY_IRREVERSIBLE,
 }
 
+# Default supported modes if not specified in manifest (commit-only for safety)
+DEFAULT_SUPPORTED_MODES = ["commit"]
+
+
+def verify_execution_mode(job: Dict[str, Any], tool_spec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    V1.2: Verify execution_mode is supported by the tool.
+
+    Turns execution_mode from a label into an invariant:
+    - Tools declare supports_modes in manifest
+    - Runner enforces: if mode not in supports_modes, deny
+
+    Returns evidence dict with verification result.
+    """
+    evidence = {
+        "mode_verified": False,
+        "execution_mode": job.get("execution_mode", "commit"),
+        "supported_modes": None,
+        "error": None,
+    }
+
+    exec_mode = job.get("execution_mode", "commit").lower()
+    supported = tool_spec.get("supports_modes", DEFAULT_SUPPORTED_MODES)
+    evidence["supported_modes"] = supported
+
+    if exec_mode not in supported:
+        evidence["error"] = (
+            f"Tool does not support execution_mode '{exec_mode}'. "
+            f"Supported modes: {supported}"
+        )
+        return evidence
+
+    evidence["mode_verified"] = True
+    return evidence
+
 
 def verify_reversibility_gate(job: Dict[str, Any], tool: str) -> Dict[str, Any]:
     """
@@ -620,8 +655,31 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
             "exit_code": -1,
         }
 
+    # V1.2: Execution mode verification (turns mode from label into invariant)
+    tool_spec = manifest.get("tools", {}).get(tool, {})
+    mode_evidence = verify_execution_mode(job, tool_spec)
+    if not mode_evidence.get("mode_verified"):
+        print(f"  ✗ Execution mode verification failed: {mode_evidence.get('error')}", flush=True)
+        return {
+            "error": "execution_mode_unsupported",
+            "detail": mode_evidence.get("error"),
+            "mode_evidence": mode_evidence,
+            "deh_evidence": deh_evidence,
+            "exit_code": -1,
+        }
+
     # V1 Step 2: Resolve budget (envelope-first, runner defaults second)
     budget = resolve_autonomy_budget({"deployment_envelope": clamped_envelope})
+
+    # V2: Apply budget_multiplier from cleanup_cost
+    budget_multiplier = job.get("budget_multiplier", 1.0)
+    if budget_multiplier != 1.0:
+        # Apply multiplier to step/tool call budgets (not runtime - that's a hard limit)
+        budget["max_steps"] = int(budget["max_steps"] * budget_multiplier)
+        budget["max_tool_calls"] = int(budget["max_tool_calls"] * budget_multiplier)
+        print(f"  ⚠ Budget adjusted by multiplier {budget_multiplier}: "
+              f"steps={budget['max_steps']}, tool_calls={budget['max_tool_calls']}", flush=True)
+
     tracker = AutonomyBudgetTracker(budget)
 
     # Preemptive AB: runtime check immediately after DEH
@@ -633,7 +691,7 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
             deh_evidence=deh_evidence,
         )
     inputs = job.get("inputs", {})
-    tool_spec = manifest.get("tools", {}).get(tool, {})
+    # tool_spec already resolved above for mode verification
     timeout_seconds = int(tool_spec.get("timeout_seconds", 30))
 
     # Preemptive AB: steps

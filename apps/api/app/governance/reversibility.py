@@ -59,10 +59,12 @@ CLEANUP_COST_BUDGET_MULTIPLIERS = {
 }
 
 # Cleanup cost retry limits
+# Note: "Unlimited" is intentionally avoided to prevent rework loops.
+# Even LOW cleanup cost gets a generous but bounded retry limit.
 CLEANUP_COST_RETRY_LIMITS = {
-    CleanupCost.LOW: None,  # Unlimited
-    CleanupCost.MEDIUM: 3,
-    CleanupCost.HIGH: 1,
+    CleanupCost.LOW: 5,      # Generous but bounded
+    CleanupCost.MEDIUM: 3,   # Moderate caution
+    CleanupCost.HIGH: 1,     # Single attempt only
 }
 
 

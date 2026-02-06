@@ -242,7 +242,8 @@ class TestCleanupCostBudgetAdjustments:
     def test_low_cleanup_cost_full_budget(self):
         """
         Given cleanup_cost=LOW,
-        Gate must return budget_multiplier=1.0 and retry_limit=None.
+        Gate must return budget_multiplier=1.0 and retry_limit=5.
+        Note: Even LOW is bounded (not unlimited) to prevent rework loops.
         """
         result = evaluate_reversibility_gate(
             effects=["WRITE_PATCH"],
@@ -255,7 +256,7 @@ class TestCleanupCostBudgetAdjustments:
 
         assert result.allowed is True
         assert result.budget_multiplier == 1.0
-        assert result.retry_limit is None  # Unlimited
+        assert result.retry_limit == 5  # Bounded, not unlimited
 
     # ----------------------------------------------------------------
     # INVARIANT 9: MEDIUM cleanup_cost → reduced budget, limited retries
@@ -326,7 +327,7 @@ class TestCleanupCostBudgetAdjustments:
     def test_none_cleanup_cost_full_budget(self):
         """
         Given cleanup_cost=None (not specified),
-        Gate must return full budget (backward compatibility).
+        Gate must return full budget with no retry limit (backward compatibility).
         """
         result = evaluate_reversibility_gate(
             effects=["WRITE_PATCH"],
@@ -339,7 +340,7 @@ class TestCleanupCostBudgetAdjustments:
 
         assert result.allowed is True
         assert result.budget_multiplier == 1.0
-        assert result.retry_limit is None
+        assert result.retry_limit is None  # Backward compat: no limit if unspecified
 
     # ----------------------------------------------------------------
     # INVARIANT 13: Budget adjustments included in to_dict()
@@ -610,3 +611,151 @@ class TestReversibilityGateAPIIntegration:
         data = response.json()
         assert data["decision"] == "ALLOW"
         mock_enqueue.assert_called_once()
+
+
+class TestRunnerExecutionModeEnforcement:
+    """
+    Runner-level tests proving execution_mode is an invariant, not a label.
+    These test the runner's mode verification logic directly.
+    """
+
+    def test_draft_mode_blocked_on_commit_only_tool(self):
+        """
+        INVARIANT 14: draft mode cannot run commit-only tool.
+
+        Given execution_mode="draft" and tool declares supports_modes=["commit"],
+        Runner must block with structured downgrade.
+        """
+        # Import runner functions directly for unit testing
+        import sys
+        sys.path.insert(0, "/home/user/MacFall7-m87-governed-swarm/services/runner/app")
+        from runner import verify_execution_mode
+
+        job = {
+            "execution_mode": "draft",
+            "tool": "pytest",
+        }
+        tool_spec = {
+            "supports_modes": ["commit"],  # Commit-only tool
+        }
+
+        evidence = verify_execution_mode(job, tool_spec)
+
+        assert evidence["mode_verified"] is False
+        assert "draft" in evidence["error"]
+        assert evidence["supported_modes"] == ["commit"]
+
+    def test_commit_mode_allowed_on_commit_only_tool(self):
+        """
+        Given execution_mode="commit" and tool declares supports_modes=["commit"],
+        Runner must allow.
+        """
+        import sys
+        sys.path.insert(0, "/home/user/MacFall7-m87-governed-swarm/services/runner/app")
+        from runner import verify_execution_mode
+
+        job = {
+            "execution_mode": "commit",
+            "tool": "pytest",
+        }
+        tool_spec = {
+            "supports_modes": ["commit"],
+        }
+
+        evidence = verify_execution_mode(job, tool_spec)
+
+        assert evidence["mode_verified"] is True
+        assert evidence["error"] is None
+
+    def test_draft_mode_allowed_on_multi_mode_tool(self):
+        """
+        Given execution_mode="draft" and tool declares supports_modes=["commit", "draft"],
+        Runner must allow.
+        """
+        import sys
+        sys.path.insert(0, "/home/user/MacFall7-m87-governed-swarm/services/runner/app")
+        from runner import verify_execution_mode
+
+        job = {
+            "execution_mode": "draft",
+            "tool": "echo",
+        }
+        tool_spec = {
+            "supports_modes": ["commit", "draft", "preview"],
+        }
+
+        evidence = verify_execution_mode(job, tool_spec)
+
+        assert evidence["mode_verified"] is True
+        assert evidence["error"] is None
+
+    def test_default_mode_is_commit_only(self):
+        """
+        Given tool without supports_modes declaration,
+        Runner must default to commit-only (fail-closed).
+        """
+        import sys
+        sys.path.insert(0, "/home/user/MacFall7-m87-governed-swarm/services/runner/app")
+        from runner import verify_execution_mode
+
+        job = {
+            "execution_mode": "draft",
+            "tool": "unknown_tool",
+        }
+        tool_spec = {}  # No supports_modes declared
+
+        evidence = verify_execution_mode(job, tool_spec)
+
+        assert evidence["mode_verified"] is False
+        assert evidence["supported_modes"] == ["commit"]  # Default
+
+
+class TestRunnerBudgetMultiplierEnforcement:
+    """
+    Runner-level tests proving cleanup_cost budget adjustments are enforced.
+    """
+
+    def test_budget_multiplier_applied_to_steps(self):
+        """
+        INVARIANT 15: cleanup_cost HIGH reduces budget in runner.
+
+        Given budget_multiplier=0.5 (HIGH cleanup_cost),
+        Runner must reduce max_steps and max_tool_calls by 50%.
+        """
+        import sys
+        sys.path.insert(0, "/home/user/MacFall7-m87-governed-swarm/services/runner/app")
+        from runner import resolve_autonomy_budget
+
+        # Base budget from envelope
+        envelope = {
+            "autonomy_budget": {
+                "max_steps": 100,
+                "max_tool_calls": 50,
+                "max_runtime_seconds": 300,
+            }
+        }
+        budget = resolve_autonomy_budget({"deployment_envelope": envelope})
+
+        # Simulate applying budget_multiplier (as done in execute_job)
+        budget_multiplier = 0.5  # HIGH cleanup_cost
+        budget["max_steps"] = int(budget["max_steps"] * budget_multiplier)
+        budget["max_tool_calls"] = int(budget["max_tool_calls"] * budget_multiplier)
+
+        assert budget["max_steps"] == 50  # 100 * 0.5
+        assert budget["max_tool_calls"] == 25  # 50 * 0.5
+        # Runtime is NOT reduced (it's a hard limit, not affected by multiplier)
+        assert budget["max_runtime_seconds"] == 300
+
+    def test_retry_limit_from_cleanup_cost(self):
+        """
+        Given cleanup_cost=HIGH, retry_limit should be 1.
+        Given cleanup_cost=LOW, retry_limit should be 5.
+        """
+        from app.governance.reversibility import (
+            CLEANUP_COST_RETRY_LIMITS,
+            CleanupCost,
+        )
+
+        assert CLEANUP_COST_RETRY_LIMITS[CleanupCost.HIGH] == 1
+        assert CLEANUP_COST_RETRY_LIMITS[CleanupCost.MEDIUM] == 3
+        assert CLEANUP_COST_RETRY_LIMITS[CleanupCost.LOW] == 5

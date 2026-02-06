@@ -1280,6 +1280,17 @@ def govern_proposal(
             return decision
 
     # Reversibility Gate passed - proceed with ALLOW
+    # Emit telemetry for allowed execution (enables ops dashboard analytics)
+    emit("reversibility_gate.allowed", {
+        "proposal_id": proposal.proposal_id,
+        "agent": agent,
+        "principal_id": auth.principal_id,
+        "reversibility_class": proposal.reversibility_class,
+        "cleanup_cost": proposal.cleanup_cost,
+        "budget_multiplier": rev_gate.budget_multiplier,
+        "retry_limit": rev_gate.retry_limit,
+    })
+
     reasons.append(f"Allowed by policy. Agent '{agent}' within scope.")
     reasons.append(f"Reversibility Gate: {rev_gate.reason}")
     decision = GovernanceDecision(
