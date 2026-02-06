@@ -32,6 +32,40 @@ class ReversibilityClass(str, Enum):
     IRREVERSIBLE = "IRREVERSIBLE"
 
 
+class CleanupCost(str, Enum):
+    """
+    V2 Upgrade: Cleanup cost classification for failed actions.
+
+    Determines how expensive it is to recover from a failed action attempt.
+    Affects autonomy budget allocation and retry policies.
+
+    LOW: Cleanup is cheap/free (e.g., delete temp files, revert local changes).
+         Autonomy: unlimited retries, full budget.
+    MEDIUM: Cleanup has moderate cost (e.g., unpublish artifact, close PR).
+         Autonomy: limited retries (3), reduced budget multiplier (0.8).
+    HIGH: Cleanup is expensive/risky (e.g., database migration rollback, revoke deployment).
+         Autonomy: single attempt (1), minimal budget multiplier (0.5).
+    """
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+
+# Cleanup cost budget multipliers (affects max_steps, max_tool_calls)
+CLEANUP_COST_BUDGET_MULTIPLIERS = {
+    CleanupCost.LOW: 1.0,
+    CleanupCost.MEDIUM: 0.8,
+    CleanupCost.HIGH: 0.5,
+}
+
+# Cleanup cost retry limits
+CLEANUP_COST_RETRY_LIMITS = {
+    CleanupCost.LOW: None,  # Unlimited
+    CleanupCost.MEDIUM: 3,
+    CleanupCost.HIGH: 1,
+}
+
+
 class ExecutionMode(str, Enum):
     """Execution mode for actions."""
     COMMIT = "commit"       # Full execution with side effects
@@ -82,6 +116,9 @@ class ReversibilityGateResult:
     reason: str
     safe_alternative: Optional[str] = None  # "draft", "preview", "approval_required"
     downgrade_to_proposal: bool = False
+    # V2: Cleanup cost budget adjustments
+    budget_multiplier: float = 1.0
+    retry_limit: Optional[int] = None  # None = unlimited
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for responses."""
@@ -93,6 +130,10 @@ class ReversibilityGateResult:
             out["safe_alternative"] = self.safe_alternative
         if self.downgrade_to_proposal:
             out["downgrade_to_proposal"] = self.downgrade_to_proposal
+        if self.budget_multiplier != 1.0:
+            out["budget_multiplier"] = self.budget_multiplier
+        if self.retry_limit is not None:
+            out["retry_limit"] = self.retry_limit
         return out
 
 
@@ -108,6 +149,7 @@ def evaluate_reversibility_gate(
     rollback_proof: Optional[Dict[str, Any]],
     execution_mode: str = "commit",
     human_approved: bool = False,
+    cleanup_cost: Optional[str] = None,
 ) -> ReversibilityGateResult:
     """
     Evaluate action against the Reversibility Gate.
@@ -119,16 +161,34 @@ def evaluate_reversibility_gate(
     4. PARTIALLY_REVERSIBLE without rollback_proof → allow only draft/preview.
     5. IRREVERSIBLE without human approval → reject, require approval.
 
+    V2 Extension: cleanup_cost affects budget allocation
+    - LOW: full budget, unlimited retries
+    - MEDIUM: 80% budget, 3 retries
+    - HIGH: 50% budget, 1 attempt
+
     Args:
         effects: List of effect tags for the action
         reversibility_class: Declared reversibility class
         rollback_proof: Rollback proof dict (if any)
         execution_mode: "commit", "draft", or "preview"
         human_approved: Whether human has explicitly approved
+        cleanup_cost: Optional cleanup cost classification (LOW/MEDIUM/HIGH)
 
     Returns:
-        ReversibilityGateResult with decision and reasoning
+        ReversibilityGateResult with decision, reasoning, and budget adjustments
     """
+    # Parse cleanup_cost for budget adjustments
+    budget_multiplier = 1.0
+    retry_limit = None
+    if cleanup_cost:
+        try:
+            cost = CleanupCost(cleanup_cost)
+            budget_multiplier = CLEANUP_COST_BUDGET_MULTIPLIERS.get(cost, 1.0)
+            retry_limit = CLEANUP_COST_RETRY_LIMITS.get(cost)
+        except ValueError:
+            # Unknown cleanup_cost defaults to conservative (MEDIUM)
+            budget_multiplier = CLEANUP_COST_BUDGET_MULTIPLIERS[CleanupCost.MEDIUM]
+            retry_limit = CLEANUP_COST_RETRY_LIMITS[CleanupCost.MEDIUM]
     # Rule 1: Read-only actions bypass the gate
     if is_read_only_action(effects):
         return ReversibilityGateResult(
@@ -169,10 +229,12 @@ def evaluate_reversibility_gate(
                 safe_alternative="proposal",
                 downgrade_to_proposal=True,
             )
-        # Has rollback proof - allowed
+        # Has rollback proof - allowed with budget adjustments
         return ReversibilityGateResult(
             allowed=True,
-            reason="REVERSIBLE action with valid rollback_proof."
+            reason="REVERSIBLE action with valid rollback_proof.",
+            budget_multiplier=budget_multiplier,
+            retry_limit=retry_limit,
         )
 
     # Rule 4: PARTIALLY_REVERSIBLE without rollback_proof → only draft/preview
@@ -184,10 +246,12 @@ def evaluate_reversibility_gate(
                 safe_alternative="draft",
                 downgrade_to_proposal=True,
             )
-        # Either has proof, or is draft/preview mode
+        # Either has proof, or is draft/preview mode - with budget adjustments
         return ReversibilityGateResult(
             allowed=True,
-            reason=f"PARTIALLY_REVERSIBLE action allowed in {mode} mode."
+            reason=f"PARTIALLY_REVERSIBLE action allowed in {mode} mode.",
+            budget_multiplier=budget_multiplier,
+            retry_limit=retry_limit,
         )
 
     # Rule 5: IRREVERSIBLE requires human approval
@@ -199,10 +263,12 @@ def evaluate_reversibility_gate(
                 safe_alternative="approval_required",
                 downgrade_to_proposal=True,
             )
-        # Human approved - allowed
+        # Human approved - allowed with budget adjustments
         return ReversibilityGateResult(
             allowed=True,
-            reason="IRREVERSIBLE action approved by human."
+            reason="IRREVERSIBLE action approved by human.",
+            budget_multiplier=budget_multiplier,
+            retry_limit=retry_limit,
         )
 
     # Fallback - should not reach here

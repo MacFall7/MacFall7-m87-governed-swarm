@@ -17,11 +17,14 @@ from unittest.mock import MagicMock, patch
 from app.governance.reversibility import (
     ReversibilityClass,
     ExecutionMode,
+    CleanupCost,
     RollbackProof,
     ReversibilityGateResult,
     evaluate_reversibility_gate,
     create_downgrade_response,
     is_read_only_action,
+    CLEANUP_COST_BUDGET_MULTIPLIERS,
+    CLEANUP_COST_RETRY_LIMITS,
 )
 
 
@@ -228,6 +231,135 @@ class TestReversibilityGateLogic:
 
         assert result.allowed is False
         assert "invalid" in result.reason.lower()
+
+
+class TestCleanupCostBudgetAdjustments:
+    """Tests for V2 Cleanup Cost → Budget Adjustment feature."""
+
+    # ----------------------------------------------------------------
+    # INVARIANT 8: LOW cleanup_cost → full budget, unlimited retries
+    # ----------------------------------------------------------------
+    def test_low_cleanup_cost_full_budget(self):
+        """
+        Given cleanup_cost=LOW,
+        Gate must return budget_multiplier=1.0 and retry_limit=None.
+        """
+        result = evaluate_reversibility_gate(
+            effects=["WRITE_PATCH"],
+            reversibility_class="REVERSIBLE",
+            rollback_proof={"description": "git revert"},
+            execution_mode="commit",
+            human_approved=False,
+            cleanup_cost="LOW",
+        )
+
+        assert result.allowed is True
+        assert result.budget_multiplier == 1.0
+        assert result.retry_limit is None  # Unlimited
+
+    # ----------------------------------------------------------------
+    # INVARIANT 9: MEDIUM cleanup_cost → reduced budget, limited retries
+    # ----------------------------------------------------------------
+    def test_medium_cleanup_cost_reduced_budget(self):
+        """
+        Given cleanup_cost=MEDIUM,
+        Gate must return budget_multiplier=0.8 and retry_limit=3.
+        """
+        result = evaluate_reversibility_gate(
+            effects=["WRITE_PATCH"],
+            reversibility_class="REVERSIBLE",
+            rollback_proof={"description": "git revert"},
+            execution_mode="commit",
+            human_approved=False,
+            cleanup_cost="MEDIUM",
+        )
+
+        assert result.allowed is True
+        assert result.budget_multiplier == 0.8
+        assert result.retry_limit == 3
+
+    # ----------------------------------------------------------------
+    # INVARIANT 10: HIGH cleanup_cost → minimal budget, single attempt
+    # ----------------------------------------------------------------
+    def test_high_cleanup_cost_minimal_budget(self):
+        """
+        Given cleanup_cost=HIGH,
+        Gate must return budget_multiplier=0.5 and retry_limit=1.
+        """
+        result = evaluate_reversibility_gate(
+            effects=["WRITE_PATCH"],
+            reversibility_class="REVERSIBLE",
+            rollback_proof={"description": "git revert"},
+            execution_mode="commit",
+            human_approved=False,
+            cleanup_cost="HIGH",
+        )
+
+        assert result.allowed is True
+        assert result.budget_multiplier == 0.5
+        assert result.retry_limit == 1
+
+    # ----------------------------------------------------------------
+    # INVARIANT 11: Unknown cleanup_cost → conservative default (MEDIUM)
+    # ----------------------------------------------------------------
+    def test_unknown_cleanup_cost_defaults_to_medium(self):
+        """
+        Given an invalid cleanup_cost value,
+        Gate must default to MEDIUM budget adjustments (fail-conservative).
+        """
+        result = evaluate_reversibility_gate(
+            effects=["WRITE_PATCH"],
+            reversibility_class="REVERSIBLE",
+            rollback_proof={"description": "git revert"},
+            execution_mode="commit",
+            human_approved=False,
+            cleanup_cost="INVALID_COST",
+        )
+
+        assert result.allowed is True
+        assert result.budget_multiplier == 0.8  # MEDIUM default
+        assert result.retry_limit == 3  # MEDIUM default
+
+    # ----------------------------------------------------------------
+    # INVARIANT 12: None cleanup_cost → full budget (backward compat)
+    # ----------------------------------------------------------------
+    def test_none_cleanup_cost_full_budget(self):
+        """
+        Given cleanup_cost=None (not specified),
+        Gate must return full budget (backward compatibility).
+        """
+        result = evaluate_reversibility_gate(
+            effects=["WRITE_PATCH"],
+            reversibility_class="REVERSIBLE",
+            rollback_proof={"description": "git revert"},
+            execution_mode="commit",
+            human_approved=False,
+            cleanup_cost=None,
+        )
+
+        assert result.allowed is True
+        assert result.budget_multiplier == 1.0
+        assert result.retry_limit is None
+
+    # ----------------------------------------------------------------
+    # INVARIANT 13: Budget adjustments included in to_dict()
+    # ----------------------------------------------------------------
+    def test_budget_adjustments_in_to_dict(self):
+        """
+        Budget adjustments must be serialized in to_dict() output.
+        """
+        result = evaluate_reversibility_gate(
+            effects=["WRITE_PATCH"],
+            reversibility_class="REVERSIBLE",
+            rollback_proof={"description": "git revert"},
+            execution_mode="commit",
+            human_approved=False,
+            cleanup_cost="HIGH",
+        )
+
+        d = result.to_dict()
+        assert d["budget_multiplier"] == 0.5
+        assert d["retry_limit"] == 1
 
 
 class TestReversibilityGateHelpers:

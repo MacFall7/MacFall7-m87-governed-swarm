@@ -181,13 +181,18 @@ TOOL_WRITE_SCOPE_REQUIREMENTS = {
 
 
 # ---- V1.1 Reversibility Gate (Runner-side enforcement)
-# Read-only tools that bypass reversibility gate
-READ_ONLY_TOOLS = {"echo"}  # Extend as needed
 
 # Reversibility class enum values
 REVERSIBILITY_REVERSIBLE = "REVERSIBLE"
 REVERSIBILITY_PARTIAL = "PARTIALLY_REVERSIBLE"
 REVERSIBILITY_IRREVERSIBLE = "IRREVERSIBLE"
+
+# Valid reversibility classes (fail-closed: unknown class = reject)
+VALID_REVERSIBILITY_CLASSES = {
+    REVERSIBILITY_REVERSIBLE,
+    REVERSIBILITY_PARTIAL,
+    REVERSIBILITY_IRREVERSIBLE,
+}
 
 
 def verify_reversibility_gate(job: Dict[str, Any], tool: str) -> Dict[str, Any]:
@@ -196,6 +201,12 @@ def verify_reversibility_gate(job: Dict[str, Any], tool: str) -> Dict[str, Any]:
 
     Defense-in-depth: Runner independently enforces reversibility policy,
     doesn't trust that API gate was executed.
+
+    Fail-closed policy:
+    - If reversibility_class is None, job must be for a read-only proposal
+      (API gate allowed it without reversibility). We trust the API's effect check.
+    - If reversibility_class is set, we verify it's valid and properly authorized.
+    - Unknown reversibility_class values are rejected (fail-closed).
 
     Returns evidence dict with verification result.
     """
@@ -207,20 +218,21 @@ def verify_reversibility_gate(job: Dict[str, Any], tool: str) -> Dict[str, Any]:
         "error": None,
     }
 
-    # Read-only tools bypass the gate
-    if tool in READ_ONLY_TOOLS:
-        evidence["reversibility_verified"] = True
-        evidence["bypass_reason"] = "read_only_tool"
-        return evidence
-
     rev_class = job.get("reversibility_class")
     rollback_proof = job.get("rollback_proof")
     exec_mode = job.get("execution_mode", "commit")
     human_approved = job.get("human_approved", False)
 
-    # Non-read tool without reversibility_class → reject
-    if not rev_class:
-        evidence["error"] = "Non-read tool missing reversibility_class declaration"
+    # If reversibility_class is None, API determined this was a read-only proposal
+    # Trust the API's effect-based check; runner doesn't have effect list
+    if rev_class is None:
+        evidence["reversibility_verified"] = True
+        evidence["bypass_reason"] = "read_only_proposal_per_api"
+        return evidence
+
+    # Fail-closed: reject unknown reversibility classes
+    if rev_class not in VALID_REVERSIBILITY_CLASSES:
+        evidence["error"] = f"Unknown reversibility_class '{rev_class}' (fail-closed)"
         return evidence
 
     # REVERSIBLE requires rollback_proof

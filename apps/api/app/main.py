@@ -427,6 +427,8 @@ class Proposal(BaseModel):
     reversibility_class: Optional[str] = None  # REVERSIBLE | PARTIALLY_REVERSIBLE | IRREVERSIBLE
     rollback_proof: Optional[Dict[str, Any]] = None  # Required for REVERSIBLE
     execution_mode: Optional[str] = "commit"  # commit | draft | preview
+    # V2 Cleanup Cost: Affects autonomy budget allocation
+    cleanup_cost: Optional[str] = None  # LOW | MEDIUM | HIGH
 
 
 class GovernanceDecision(BaseModel):
@@ -453,6 +455,10 @@ class JobSpec(BaseModel):
     rollback_proof: Optional[Dict[str, Any]] = None
     execution_mode: str = "commit"
     human_approved: bool = False
+    # V2 Cleanup Cost: Budget adjustments from gate
+    cleanup_cost: Optional[str] = None
+    budget_multiplier: float = 1.0
+    retry_limit: Optional[int] = None
 
 
 # Phase 5 Step 3: Strict runner result contract
@@ -654,6 +660,10 @@ def enqueue_job(
     rollback_proof: Optional[Dict[str, Any]] = None,
     execution_mode: str = "commit",
     human_approved: bool = False,
+    # V2 Cleanup Cost
+    cleanup_cost: Optional[str] = None,
+    budget_multiplier: float = 1.0,
+    retry_limit: Optional[int] = None,
 ) -> str:
     """
     Mint a JobSpec and add to jobs stream.
@@ -714,6 +724,10 @@ def enqueue_job(
         "rollback_proof": rollback_proof,
         "execution_mode": execution_mode,
         "human_approved": human_approved,
+        # V2 Cleanup Cost
+        "cleanup_cost": cleanup_cost,
+        "budget_multiplier": budget_multiplier,
+        "retry_limit": retry_limit,
     }
 
     # Phase 2: Persist job to Postgres (write-through)
@@ -1186,12 +1200,14 @@ def govern_proposal(
 
     # Phase 3-6 passed (or disabled) - check V1.1 Reversibility Gate
     # Gate enforces: non-read actions must declare reversibility_class
+    # V2: Gate also returns budget adjustments based on cleanup_cost
     rev_gate = evaluate_reversibility_gate(
         effects=[str(e) for e in proposal.effects],
         reversibility_class=proposal.reversibility_class,
         rollback_proof=proposal.rollback_proof,
         execution_mode=proposal.execution_mode or "commit",
         human_approved=False,  # Not yet approved
+        cleanup_cost=proposal.cleanup_cost,
     )
 
     if not rev_gate.allowed:
@@ -1305,6 +1321,10 @@ def govern_proposal(
         rollback_proof=proposal.rollback_proof,
         execution_mode=proposal.execution_mode or "commit",
         human_approved=False,
+        # V2 Cleanup Cost: Pass budget adjustments from gate
+        cleanup_cost=proposal.cleanup_cost,
+        budget_multiplier=rev_gate.budget_multiplier,
+        retry_limit=rev_gate.retry_limit,
     )
 
     # Return decision with job_id for convenience
@@ -1411,6 +1431,17 @@ def approve(
     }
     emit("proposal.approved", evt)
 
+    # V2: Re-evaluate gate with human_approved=True to get budget adjustments
+    from .governance.reversibility import evaluate_reversibility_gate
+    approve_gate = evaluate_reversibility_gate(
+        effects=proposal_data.get("effects", []),
+        reversibility_class=proposal_data.get("reversibility_class"),
+        rollback_proof=proposal_data.get("rollback_proof"),
+        execution_mode=proposal_data.get("execution_mode", "commit"),
+        human_approved=True,
+        cleanup_cost=proposal_data.get("cleanup_cost"),
+    )
+
     job_id = enqueue_job(
         proposal_id=proposal_id,
         tool="echo",
@@ -1420,6 +1451,10 @@ def approve(
         rollback_proof=proposal_data.get("rollback_proof"),
         execution_mode=proposal_data.get("execution_mode", "commit"),
         human_approved=True,  # Key: human has approved
+        # V2 Cleanup Cost: Pass budget adjustments from gate
+        cleanup_cost=proposal_data.get("cleanup_cost"),
+        budget_multiplier=approve_gate.budget_multiplier,
+        retry_limit=approve_gate.retry_limit,
     )
 
     rdb.delete(pending_key)
