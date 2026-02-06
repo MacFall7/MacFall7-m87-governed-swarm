@@ -91,7 +91,19 @@ echo ""
 if [ -f "$ROOT_DIR/apps/api/requirements-test.txt" ]; then
     cd "$ROOT_DIR/apps/api"
 
-    if command -v pytest >/dev/null 2>&1; then
+    # Check for required Python packages
+    MISSING_DEPS=""
+    python3 -c "import pytest" 2>/dev/null || MISSING_DEPS="$MISSING_DEPS pytest"
+    python3 -c "import fastapi" 2>/dev/null || MISSING_DEPS="$MISSING_DEPS fastapi"
+    python3 -c "import pydantic" 2>/dev/null || MISSING_DEPS="$MISSING_DEPS pydantic"
+
+    if [ -n "$MISSING_DEPS" ]; then
+        echo -e "${RED}✗ Missing API test dependencies:${NC}$MISSING_DEPS"
+        echo ""
+        echo "  Fix with: pip install -r apps/api/requirements-test.txt"
+        echo ""
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    else
         echo "Running pytest..."
         if pytest tests/ -v --tb=short 2>&1 | tee "$EVIDENCE_DIR/api-tests-output.txt"; then
             echo ""
@@ -102,10 +114,6 @@ if [ -f "$ROOT_DIR/apps/api/requirements-test.txt" ]; then
             echo -e "${RED}✗ API unit tests FAILED${NC}"
             TESTS_FAILED=$((TESTS_FAILED + 1))
         fi
-    else
-        echo -e "${YELLOW}⚠ pytest not installed${NC}"
-        echo "  Install with: pip install -r apps/api/requirements-test.txt"
-        TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
     fi
 
     cd "$ROOT_DIR"
@@ -126,7 +134,19 @@ echo ""
 if [ -f "$ROOT_DIR/apps/ui/package.json" ]; then
     cd "$ROOT_DIR/apps/ui"
 
-    if command -v npm >/dev/null 2>&1 && [ -d "node_modules" ]; then
+    if ! command -v npm >/dev/null 2>&1; then
+        echo -e "${RED}✗ npm not installed${NC}"
+        echo ""
+        echo "  Fix with: Install Node.js (includes npm)"
+        echo ""
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    elif [ ! -d "node_modules" ]; then
+        echo -e "${RED}✗ UI dependencies not installed${NC}"
+        echo ""
+        echo "  Fix with: cd apps/ui && npm install"
+        echo ""
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    else
         echo "Running UI governance tests..."
         if npm test 2>&1 | tee "$EVIDENCE_DIR/ui-tests-output.txt"; then
             echo ""
@@ -137,10 +157,6 @@ if [ -f "$ROOT_DIR/apps/ui/package.json" ]; then
             echo -e "${RED}✗ UI governance tests FAILED${NC}"
             TESTS_FAILED=$((TESTS_FAILED + 1))
         fi
-    else
-        echo -e "${YELLOW}⚠ npm not installed or node_modules missing${NC}"
-        echo "  Install with: cd apps/ui && npm install"
-        TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
     fi
 
     cd "$ROOT_DIR"
