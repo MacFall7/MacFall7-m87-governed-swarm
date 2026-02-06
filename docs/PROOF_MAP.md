@@ -10,16 +10,16 @@ This document maps security claims to their enforcement mechanisms and verificat
 
 | Claim | Mechanism | Test | Proof Script |
 |-------|-----------|------|--------------|
-| **No autonomous execution** | Split-brain architecture: agents propose, runner executes | `test_governance.py::test_agents_cannot_execute` | `scripts/proof-test.sh` |
-| **Approval required for jobs** | `govern_proposal()` gates all job minting | `test_governance.py::test_no_job_without_approval` | `scripts/proof-test.sh` |
-| **READ_SECRETS always denied** | Hardcoded DENY in governance rules | `test_governance.py::test_secrets_always_denied` | `scripts/proof-test.sh` |
-| **IRREVERSIBLE requires human** | Reversibility gate in API + Runner | `test_governance.py::test_irreversible_needs_human` | `scripts/proof-test.sh` |
-| **DEH verified independently** | Runner recomputes envelope hash | `test_runner.py::test_deh_verification` | Runner logs on mismatch |
-| **Manifest drift rejected** | Hash comparison at job execution | `test_runner.py::test_manifest_drift_rejected` | Runner logs on mismatch |
-| **Budget exhaustion halts** | Preemptive try_* gates | `test_runner.py::test_budget_enforcement` | Runner error codes |
-| **Completion requires artifacts** | Runner artifact check | `test_runner.py::test_artifact_required` | Runner error codes |
-| **Toxic topology detected** | SessionRiskTracker sliding window | `test_governance.py::test_toxic_topology_*` | Redis session data |
-| **Unknown state = DENY** | Default rejection in all paths | `test_governance.py::test_fail_closed_*` | N/A (absence of bypass) |
+| **No autonomous execution** | Split-brain architecture: agents propose, runner executes | `test_governance_invariants.py` | `scripts/proof-test.sh` |
+| **Approval required for jobs** | `govern_proposal()` gates all job minting | `test_governance_invariants.py::TestGovernanceInvariants` | `scripts/proof-test.sh` |
+| **READ_SECRETS always denied** | Hardcoded DENY in governance rules | `test_governance_invariants.py::test_read_secrets_*` | `scripts/proof-test.sh` |
+| **IRREVERSIBLE requires human** | Reversibility gate in API + Runner | `test_reversibility_gate_invariants.py::TestReversibilityGateLogic` | `scripts/proof-test.sh` |
+| **DEH verified independently** | Runner recomputes envelope hash | `services/runner/tests/test_runner.py::test_deh_*` | Runner logs on mismatch |
+| **Manifest drift rejected** | Hash comparison at job execution | `services/runner/tests/test_runner.py::test_manifest_*` | Runner logs on mismatch |
+| **Budget exhaustion halts** | Preemptive try_* gates | `test_reversibility_gate_invariants.py::TestRunnerBudgetMultiplier*` | Runner error codes |
+| **Completion requires artifacts** | Runner artifact check | `services/runner/tests/test_runner.py::test_artifact_*` | Runner error codes |
+| **Toxic topology detected** | SessionRiskTracker sliding window | `test_governance_redteam_invariants.py::TestSessionRiskTracker` | Redis session data |
+| **Unknown state = DENY** | Default rejection in all paths | `test_governance_invariants.py::TestFailSafeInvariants` | N/A (absence of bypass) |
 | **UI normalization fail-closed** | `normalizeIncomingGovernance()` | `governance-normalization.test.ts` | N/A (unit tests) |
 | **Reconciliation re-validates** | `reconcileGovernanceState()` | `governance-normalization.test.ts::reconciliation_*` | N/A (unit tests) |
 
@@ -76,10 +76,15 @@ This document maps security claims to their enforcement mechanisms and verificat
 
 | Evidence Type | Location | Purpose |
 |---------------|----------|---------|
-| API governance tests | `apps/api/tests/test_governance.py` | Verify policy enforcement |
+| Auth invariant tests | `apps/api/tests/test_auth_invariants.py` | Verify authentication checks |
+| Governance invariant tests | `apps/api/tests/test_governance_invariants.py` | Verify policy enforcement |
+| Red team invariant tests | `apps/api/tests/test_governance_redteam_invariants.py` | Verify attack resistance |
+| Reversibility gate tests | `apps/api/tests/test_reversibility_gate_invariants.py` | Verify reversibility + budget |
 | Runner tests | `services/runner/tests/test_runner.py` | Verify execution controls |
 | UI normalization tests | `apps/ui/lib/__tests__/governance-normalization.test.ts` | Verify fail-closed UI |
+| UI style compliance tests | `apps/ui/lib/__tests__/governance-style-compliance.test.ts` | Verify semantic tokens |
 | Proof script | `scripts/proof-test.sh` | End-to-end invariant verification |
+| Audit script | `scripts/audit.sh` | One-command evidence generation |
 | Audit log | `m87:events` (Redis stream) | Runtime event trail |
 | Manifest lock | `services/runner/manifest.lock.json` | Supply-chain hash |
 
@@ -102,13 +107,16 @@ These emergency overrides are documented for transparency:
 
 For auditors and security reviewers:
 
-- [ ] Run `./scripts/proof-test.sh` and verify all checks pass
+- [ ] Run `./scripts/audit.sh` and verify `AUDIT PASSED - GUARANTEES VERIFIED`
+- [ ] Verify all 76 API tests pass (auth, governance, redteam, reversibility)
+- [ ] Verify all 36 UI tests pass (normalization + style compliance)
 - [ ] Inspect `apps/api/app/main.py::govern_proposal()` for hardcoded DENY rules
 - [ ] Inspect `services/runner/app/runner.py::execute_job()` for defense-in-depth checks
+- [ ] Look for `INTENT PRESERVATION` comments explaining rejection behavior
 - [ ] Verify manifest lock exists: `services/runner/manifest.lock.json`
-- [ ] Verify UI tests pass: `cd apps/ui && npm test`
 - [ ] Confirm Redis `m87:events` stream is populated with governance events
 - [ ] Verify no direct tool execution in adapter code (grep for subprocess calls)
+- [ ] Check CI badge is green: `https://github.com/MacFall7/MacFall7-m87-governed-swarm/actions`
 
 ---
 

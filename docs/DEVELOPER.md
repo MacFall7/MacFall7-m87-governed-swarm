@@ -326,6 +326,40 @@ TOOL_ALLOWLIST = {"echo", "pytest", "git", "build", "my_new_tool"}
 
 ## Testing
 
+### Run full audit (recommended)
+
+```bash
+./scripts/audit.sh
+```
+
+This runs all tests and generates evidence in `evidence/`. Expected output:
+- API tests: 76 passed
+- UI tests: 36 passed
+- Final: `AUDIT PASSED - GUARANTEES VERIFIED`
+
+### Run API unit tests
+
+```bash
+cd apps/api
+python3 -m pytest tests/ -v --tb=short
+```
+
+Test files:
+- `test_auth_invariants.py` - Authentication checks (13 tests)
+- `test_governance_invariants.py` - Policy enforcement (8 tests)
+- `test_governance_redteam_invariants.py` - Attack resistance (22 tests)
+- `test_reversibility_gate_invariants.py` - Reversibility + budget (33 tests)
+
+### Run UI governance tests
+
+```bash
+cd apps/ui
+npm test                    # Run all tests (36 tests)
+npm run test:watch          # Watch mode
+npm run test:coverage       # With coverage
+npm run typecheck           # Type checking only
+```
+
 ### Run syntax checks
 
 ```bash
@@ -333,20 +367,11 @@ python3 -m py_compile apps/api/app/main.py
 python3 -m py_compile services/runner/app/runner.py
 ```
 
-### Run UI governance tests
+### Run integration tests (requires API running)
 
 ```bash
-cd apps/ui
-npm test                    # Run all tests
-npm run test:watch          # Watch mode
-npm run test:coverage       # With coverage
-npm run typecheck           # Type checking only
-```
-
-### Run proof tests
-
-```bash
-./scripts/proof-test.sh
+./scripts/boot.sh           # Start services
+./scripts/proof-test.sh     # Run 7-invariant proof
 ```
 
 ### Manual API testing

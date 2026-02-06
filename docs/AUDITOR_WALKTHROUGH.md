@@ -31,12 +31,16 @@ Read in this order:
 ```
 
 This script:
-- Runs integration tests (7 invariants)
-- Runs API unit tests
-- Runs UI governance tests
+- Runs integration tests (7 invariants) - if API is running
+- Runs API unit tests (76 tests: auth, governance, redteam, reversibility)
+- Runs UI governance tests (36 tests: normalization + style compliance)
 - Generates evidence in `evidence/` directory
 
 **Expected output**: `AUDIT PASSED - GUARANTEES VERIFIED`
+
+**Expected test counts**:
+- API: 76 passed
+- UI: 36 passed (1 skipped - broad style check)
 
 If any test fails, the audit fails. Do not trust the system until all tests pass.
 

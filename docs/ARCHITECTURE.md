@@ -9,15 +9,15 @@ These are the system's **inviolable constraints**. Each law maps directly to enf
 | # | Law | Enforcement | Test File |
 |---|-----|-------------|-----------|
 | 1 | **Agents cannot execute tools** | Runner is the only component that calls subprocess | `proof-test.sh` (no tool calls outside runner) |
-| 2 | **No approval → no job** | `govern_proposal()` gates all job minting | `apps/api/tests/test_governance.py` |
-| 3 | **Unknown state → DENY** | All governance paths default to rejection | `apps/api/tests/test_governance.py::test_fail_closed_*` |
+| 2 | **No approval → no job** | `govern_proposal()` gates all job minting | `test_governance_invariants.py` |
+| 3 | **Unknown state → DENY** | All governance paths default to rejection | `test_governance_invariants.py::TestFailSafeInvariants` |
 | 4 | **DEH mismatch → reject** | Runner recomputes envelope hash independently | `services/runner/tests/test_runner.py::test_deh_*` |
 | 5 | **Manifest drift → refuse** | Runner compares job.manifest_hash to loaded hash | `services/runner/tests/test_runner.py::test_manifest_*` |
-| 6 | **Budget exhaustion → halt** | Preemptive `try_*` gates in AutonomyBudgetTracker | `services/runner/tests/test_runner.py::test_budget_*` |
+| 6 | **Budget exhaustion → halt** | Preemptive `try_*` gates in AutonomyBudgetTracker | `test_reversibility_gate_invariants.py::TestRunnerBudget*` |
 | 7 | **No artifacts → no completion** | Runner requires verifiable completion_artifacts | `services/runner/tests/test_runner.py::test_artifact_*` |
-| 8 | **IRREVERSIBLE → human approval** | Reversibility gate blocks without explicit approval | `apps/api/tests/test_governance.py::test_reversibility_*` |
-| 9 | **READ_SECRETS → always DENY** | Hardcoded rejection in govern_proposal() | `apps/api/tests/test_governance.py::test_secrets_denied` |
-| 10 | **Toxic topology → escalate** | SessionRiskTracker detects effect sequences | `apps/api/tests/test_governance.py::test_toxic_*` |
+| 8 | **IRREVERSIBLE → human approval** | Reversibility gate blocks without explicit approval | `test_reversibility_gate_invariants.py::TestReversibilityGate*` |
+| 9 | **READ_SECRETS → always DENY** | Hardcoded rejection in govern_proposal() | `test_governance_invariants.py::test_read_secrets_*` |
+| 10 | **Toxic topology → escalate** | SessionRiskTracker detects effect sequences | `test_governance_redteam_invariants.py::TestSessionRiskTracker` |
 
 **Audit trail**: Every law violation emits an event to `m87:events` with the specific law code and rejection reason.
 
