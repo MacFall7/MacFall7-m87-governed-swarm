@@ -91,21 +91,24 @@ echo ""
 if [ -f "$ROOT_DIR/apps/api/requirements-test.txt" ]; then
     cd "$ROOT_DIR/apps/api"
 
-    # Check for required Python packages
-    MISSING_DEPS=""
-    python3 -c "import pytest" 2>/dev/null || MISSING_DEPS="$MISSING_DEPS pytest"
-    python3 -c "import fastapi" 2>/dev/null || MISSING_DEPS="$MISSING_DEPS fastapi"
-    python3 -c "import pydantic" 2>/dev/null || MISSING_DEPS="$MISSING_DEPS pydantic"
-
-    if [ -n "$MISSING_DEPS" ]; then
-        echo -e "${RED}✗ Missing API test dependencies:${NC}$MISSING_DEPS"
+    # Pre-flight: verify we can import the app (catches missing deps)
+    echo "Checking API dependencies..."
+    if ! python3 -c "import sys; sys.path.insert(0, '.'); from app.main import app" 2>/dev/null; then
+        echo -e "${RED}✗ Missing API dependencies (fastapi, pydantic, redis, etc.)${NC}"
         echo ""
         echo "  Fix with: pip install -r apps/api/requirements-test.txt"
         echo ""
         TESTS_FAILED=$((TESTS_FAILED + 1))
+    elif ! python3 -c "import pytest" 2>/dev/null; then
+        echo -e "${RED}✗ pytest not installed in Python environment${NC}"
+        echo ""
+        echo "  Fix with: pip install pytest pytest-cov pytest-asyncio"
+        echo ""
+        TESTS_FAILED=$((TESTS_FAILED + 1))
     else
         echo "Running pytest..."
-        if pytest tests/ -v --tb=short 2>&1 | tee "$EVIDENCE_DIR/api-tests-output.txt"; then
+        # Use python3 -m pytest to ensure same Python environment as deps
+        if python3 -m pytest tests/ -v --tb=short 2>&1 | tee "$EVIDENCE_DIR/api-tests-output.txt"; then
             echo ""
             echo -e "${GREEN}✓ API unit tests PASSED${NC}"
             TESTS_PASSED=$((TESTS_PASSED + 1))
