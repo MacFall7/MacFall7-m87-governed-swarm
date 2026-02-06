@@ -479,6 +479,11 @@ function reconcileGovernanceState(state: GovernanceState): GovernanceState {
     state.gate_state
   );
 
+  // reconciliation_applied = true IFF reconciliation changed derived state
+  // Specifically: blocked flipped from false → true (UI overrode backend claim)
+  const blockedFlipped = !state.blocked && blockingSignals.blocked;
+  const reasonChanged = state.blocking_reason !== blockingSignals.reason && blockingSignals.reason;
+
   return {
     ...state,
     blocked: blockingSignals.blocked,
@@ -489,7 +494,7 @@ function reconcileGovernanceState(state: GovernanceState): GovernanceState {
       normalized_at: new Date(),
       source: "reconciled",
       unknown_fields: unknownFields,
-      reconciliation_applied: true,
+      reconciliation_applied: blockedFlipped || !!reasonChanged,
       fail_closed_triggered:
         state._normalization?.fail_closed_triggered ||
         blockingSignals.failClosedTriggered,

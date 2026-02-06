@@ -435,7 +435,56 @@ describe("Governance Normalization Boundary", () => {
 
       expect(reconciled).toBeDefined();
       expect(reconciled!.blocked).toBe(true); // Fail-closed wins
+      // reconciliation_applied = true because blocked flipped false → true
       expect(reconciled!._normalization.reconciliation_applied).toBe(true);
+    });
+
+    it("reconciliation_applied is false when no override needed", () => {
+      // State that is already correctly blocked
+      const correctlyBlockedState: GovernanceState = {
+        proposal_id: "already-blocked",
+        agent: "Casey",
+        principal_id: "principal-1",
+        blocked: true, // Already blocked
+        blocking_reason: "STEP_BUDGET",
+        gate_state: {
+          reversibility: "allowed",
+          mode_contract: "allowed",
+          human_approval: "allowed",
+          overall: "allowed",
+        },
+        budget_state: {
+          max_steps: 0, // Correctly triggers block
+          steps_used: 0,
+          percentage_used: 100,
+          max_tool_calls: 50,
+          tool_calls_used: 0,
+          max_runtime_seconds: 300,
+          runtime_used_seconds: 0,
+          retries_remaining: 5,
+          budget_multiplier: 1.0,
+        },
+        reversibility_class: "REVERSIBLE",
+        cleanup_cost: "LOW",
+        execution_mode: "commit",
+        human_approved: false,
+        events: [],
+        _normalization: {
+          normalized_at: new Date(),
+          source: "raw",
+          unknown_fields: [],
+          raw_values: {},
+          reconciliation_applied: false,
+          fail_closed_triggered: false,
+        },
+      };
+
+      const reconciled = normalizeIncomingGovernance(correctlyBlockedState);
+
+      expect(reconciled).toBeDefined();
+      expect(reconciled!.blocked).toBe(true);
+      // reconciliation_applied = false because blocked didn't flip
+      expect(reconciled!._normalization.reconciliation_applied).toBe(false);
     });
   });
 
