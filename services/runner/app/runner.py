@@ -180,6 +180,78 @@ TOOL_WRITE_SCOPE_REQUIREMENTS = {
 }
 
 
+# ---- V1.1 Reversibility Gate (Runner-side enforcement)
+# Read-only tools that bypass reversibility gate
+READ_ONLY_TOOLS = {"echo"}  # Extend as needed
+
+# Reversibility class enum values
+REVERSIBILITY_REVERSIBLE = "REVERSIBLE"
+REVERSIBILITY_PARTIAL = "PARTIALLY_REVERSIBLE"
+REVERSIBILITY_IRREVERSIBLE = "IRREVERSIBLE"
+
+
+def verify_reversibility_gate(job: Dict[str, Any], tool: str) -> Dict[str, Any]:
+    """
+    Runner-side verification of reversibility gate.
+
+    Defense-in-depth: Runner independently enforces reversibility policy,
+    doesn't trust that API gate was executed.
+
+    Returns evidence dict with verification result.
+    """
+    evidence = {
+        "reversibility_verified": False,
+        "reversibility_class": job.get("reversibility_class"),
+        "execution_mode": job.get("execution_mode", "commit"),
+        "human_approved": job.get("human_approved", False),
+        "error": None,
+    }
+
+    # Read-only tools bypass the gate
+    if tool in READ_ONLY_TOOLS:
+        evidence["reversibility_verified"] = True
+        evidence["bypass_reason"] = "read_only_tool"
+        return evidence
+
+    rev_class = job.get("reversibility_class")
+    rollback_proof = job.get("rollback_proof")
+    exec_mode = job.get("execution_mode", "commit")
+    human_approved = job.get("human_approved", False)
+
+    # Non-read tool without reversibility_class → reject
+    if not rev_class:
+        evidence["error"] = "Non-read tool missing reversibility_class declaration"
+        return evidence
+
+    # REVERSIBLE requires rollback_proof
+    if rev_class == REVERSIBILITY_REVERSIBLE:
+        if not rollback_proof:
+            evidence["error"] = "REVERSIBLE action requires rollback_proof"
+            return evidence
+        evidence["reversibility_verified"] = True
+        return evidence
+
+    # PARTIALLY_REVERSIBLE without proof → only draft/preview
+    if rev_class == REVERSIBILITY_PARTIAL:
+        if not rollback_proof and exec_mode == "commit":
+            evidence["error"] = "PARTIALLY_REVERSIBLE commit requires rollback_proof"
+            return evidence
+        evidence["reversibility_verified"] = True
+        return evidence
+
+    # IRREVERSIBLE requires human approval
+    if rev_class == REVERSIBILITY_IRREVERSIBLE:
+        if not human_approved:
+            evidence["error"] = "IRREVERSIBLE action requires explicit human approval"
+            return evidence
+        evidence["reversibility_verified"] = True
+        return evidence
+
+    # Unknown class
+    evidence["error"] = f"Unknown reversibility_class: {rev_class}"
+    return evidence
+
+
 def scope_rank(scope: str) -> int:
     """Rank write scopes from least to most permissive."""
     return {"none": 0, "sandbox": 1, "staging": 2, "prod": 3}.get(scope, 99)
@@ -522,6 +594,20 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
     envelope = job.get("deployment_envelope", {})
     clamped_envelope = enforce_open_weight_safety(envelope)
 
+    tool = job["tool"]
+
+    # V1.1 Reversibility Gate: Runner-side enforcement (defense-in-depth)
+    rev_evidence = verify_reversibility_gate(job, tool)
+    if not rev_evidence.get("reversibility_verified"):
+        print(f"  ✗ Reversibility Gate failed: {rev_evidence.get('error')}", flush=True)
+        return {
+            "error": "reversibility_gate_failed",
+            "detail": rev_evidence.get("error"),
+            "reversibility_evidence": rev_evidence,
+            "deh_evidence": deh_evidence,
+            "exit_code": -1,
+        }
+
     # V1 Step 2: Resolve budget (envelope-first, runner defaults second)
     budget = resolve_autonomy_budget({"deployment_envelope": clamped_envelope})
     tracker = AutonomyBudgetTracker(budget)
@@ -534,8 +620,6 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
             tracker=tracker,
             deh_evidence=deh_evidence,
         )
-
-    tool = job["tool"]
     inputs = job.get("inputs", {})
     tool_spec = manifest.get("tools", {}).get(tool, {})
     timeout_seconds = int(tool_spec.get("timeout_seconds", 30))

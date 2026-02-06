@@ -37,6 +37,13 @@ from .db import (
 from .routes.govern_proposal import router as govern_router
 from .routes.govern_proposal import evaluate_governance_proposal
 
+# V1.1 Reversibility Gate
+from .governance.reversibility import (
+    evaluate_reversibility_gate,
+    create_downgrade_response,
+    is_read_only_action,
+)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -416,6 +423,10 @@ class Proposal(BaseModel):
     risk_score: Optional[float] = None
     # V1 Governance: Optional deployment envelope (defaults applied if not provided)
     deployment_envelope: Optional[Dict[str, Any]] = None
+    # V1.1 Reversibility Gate: Required for non-read actions
+    reversibility_class: Optional[str] = None  # REVERSIBLE | PARTIALLY_REVERSIBLE | IRREVERSIBLE
+    rollback_proof: Optional[Dict[str, Any]] = None  # Required for REVERSIBLE
+    execution_mode: Optional[str] = "commit"  # commit | draft | preview
 
 
 class GovernanceDecision(BaseModel):
@@ -425,6 +436,9 @@ class GovernanceDecision(BaseModel):
     required_approvals: Optional[List[str]] = None
     allowed_effects: Optional[List[EffectTag]] = None
     job_id: Optional[str] = None  # V1: included when job is minted
+    # V1.1 Reversibility Gate
+    reversibility_gate: Optional[Dict[str, Any]] = None  # Gate evaluation result
+    safe_alternative: Optional[str] = None  # draft | preview | approval_required
 
 
 class JobSpec(BaseModel):
@@ -434,6 +448,11 @@ class JobSpec(BaseModel):
     inputs: Dict[str, Any] = {}
     sandbox: Dict[str, str] = {"network": "deny", "fs": "ro"}
     timeout_seconds: int = 60
+    # V1.1 Reversibility Gate: Passed to runner for enforcement
+    reversibility_class: Optional[str] = None
+    rollback_proof: Optional[Dict[str, Any]] = None
+    execution_mode: str = "commit"
+    human_approved: bool = False
 
 
 # Phase 5 Step 3: Strict runner result contract
@@ -630,6 +649,11 @@ def enqueue_job(
     tool: str,
     inputs: Dict[str, Any] = None,
     envelope: Optional[DeploymentEnvelope] = None,
+    # V1.1 Reversibility Gate
+    reversibility_class: Optional[str] = None,
+    rollback_proof: Optional[Dict[str, Any]] = None,
+    execution_mode: str = "commit",
+    human_approved: bool = False,
 ) -> str:
     """
     Mint a JobSpec and add to jobs stream.
@@ -685,6 +709,11 @@ def enqueue_job(
         "autonomy_budget": job_envelope.autonomy_budget.model_dump(),
         "safety_mode": job_envelope.safety_mode,
         "model_id": job_envelope.model_id,
+        # V1.1 Reversibility Gate
+        "reversibility_class": reversibility_class,
+        "rollback_proof": rollback_proof,
+        "execution_mode": execution_mode,
+        "human_approved": human_approved,
     }
 
     # Phase 2: Persist job to Postgres (write-through)
@@ -1155,8 +1184,88 @@ def govern_proposal(
             })
             return decision
 
-    # Phase 3-6 passed (or disabled) - proceed with ALLOW
+    # Phase 3-6 passed (or disabled) - check V1.1 Reversibility Gate
+    # Gate enforces: non-read actions must declare reversibility_class
+    rev_gate = evaluate_reversibility_gate(
+        effects=[str(e) for e in proposal.effects],
+        reversibility_class=proposal.reversibility_class,
+        rollback_proof=proposal.rollback_proof,
+        execution_mode=proposal.execution_mode or "commit",
+        human_approved=False,  # Not yet approved
+    )
+
+    if not rev_gate.allowed:
+        # Emit telemetry for blocked execution
+        emit("reversibility_gate.blocked", {
+            "proposal_id": proposal.proposal_id,
+            "agent": agent,
+            "principal_id": auth.principal_id,
+            "reversibility_class": proposal.reversibility_class,
+            "reason": rev_gate.reason,
+            "safe_alternative": rev_gate.safe_alternative,
+        })
+
+        # Determine decision based on gate result
+        if rev_gate.safe_alternative == "approval_required":
+            # IRREVERSIBLE requires human approval
+            reasons.append(f"Reversibility Gate: {rev_gate.reason}")
+            decision = GovernanceDecision(
+                proposal_id=proposal.proposal_id,
+                decision="REQUIRE_HUMAN",
+                reasons=reasons,
+                required_approvals=["mac"],
+                allowed_effects=proposal.effects,
+                reversibility_gate=rev_gate.to_dict(),
+                safe_alternative=rev_gate.safe_alternative,
+            )
+            persist_decision(
+                proposal_id=proposal.proposal_id,
+                outcome="REQUIRE_HUMAN",
+                reasons=reasons,
+                decided_by="policy:reversibility_gate",
+                required_approvals=["mac"],
+                allowed_effects=list(proposal.effects),
+            )
+            emit("proposal.needs_approval", {
+                **decision.model_dump(),
+                "summary": proposal.summary,
+                "agent": agent,
+                "principal_id": auth.principal_id,
+                "reversibility_reason": rev_gate.reason,
+            })
+            rdb.hset(f"m87:pending:{proposal.proposal_id}", mapping={
+                "proposal": json.dumps(proposal.model_dump()),
+                "decision": json.dumps(decision.model_dump()),
+                "reversibility_gate": json.dumps(rev_gate.to_dict()),
+            })
+            return decision
+        else:
+            # Missing reversibility declaration or proof - downgrade to proposal
+            reasons.append(f"Reversibility Gate: {rev_gate.reason}")
+            decision = GovernanceDecision(
+                proposal_id=proposal.proposal_id,
+                decision="DENY",
+                reasons=reasons,
+                reversibility_gate=rev_gate.to_dict(),
+                safe_alternative=rev_gate.safe_alternative,
+            )
+            persist_decision(
+                proposal_id=proposal.proposal_id,
+                outcome="DENY",
+                reasons=reasons,
+                decided_by="policy:reversibility_gate",
+            )
+            emit("proposal.denied", {
+                **decision.model_dump(),
+                "agent": agent,
+                "principal_id": auth.principal_id,
+                "reversibility_reason": rev_gate.reason,
+            })
+            return decision
+
+    # Reversibility Gate passed - proceed with ALLOW
     reasons.append(f"Allowed by policy. Agent '{agent}' within scope.")
+    reasons.append(f"Reversibility Gate: {rev_gate.reason}")
     decision = GovernanceDecision(
         proposal_id=proposal.proposal_id,
         decision="ALLOW",
@@ -1191,6 +1300,11 @@ def govern_proposal(
         tool="echo",
         inputs={"message": f"[{agent}] {proposal.summary}"},
         envelope=job_envelope,
+        # V1.1 Reversibility fields
+        reversibility_class=proposal.reversibility_class,
+        rollback_proof=proposal.rollback_proof,
+        execution_mode=proposal.execution_mode or "commit",
+        human_approved=False,
     )
 
     # Return decision with job_id for convenience
@@ -1300,7 +1414,12 @@ def approve(
     job_id = enqueue_job(
         proposal_id=proposal_id,
         tool="echo",
-        inputs={"message": f"Approved: {proposal_data.get('summary', 'unknown')}"}
+        inputs={"message": f"Approved: {proposal_data.get('summary', 'unknown')}"},
+        # V1.1 Reversibility: Human approved, pass fields to runner
+        reversibility_class=proposal_data.get("reversibility_class"),
+        rollback_proof=proposal_data.get("rollback_proof"),
+        execution_mode=proposal_data.get("execution_mode", "commit"),
+        human_approved=True,  # Key: human has approved
     )
 
     rdb.delete(pending_key)
