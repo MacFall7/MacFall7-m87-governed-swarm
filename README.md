@@ -58,6 +58,40 @@ The API enforces additional governance before jobs are even minted:
 
 No execution path can enqueue jobs without passing Phase 3-6 governance.
 
+### UI Governance Observability Layer
+
+The UI includes a **fail-closed normalization boundary** that ensures all governance data is consistently validated before display.
+
+**Key Components:**
+
+| Module | Purpose |
+|--------|---------|
+| `normalize.ts` | Single entry point for all governance data |
+| `data.ts` | API client that makes normalization inescapable |
+| `analytics.ts` | Governance metrics and dashboard computations |
+| `persistence.ts` | Serialization with reconciliation on load |
+| `types.ts` | Canonical TypeScript types |
+| `mock.ts` | Test data that flows through normalization |
+
+**Fail-Closed Invariants:**
+
+1. **ANY blocking signal forces blocked=true** - No exceptions
+2. **Unknown enums default conservatively** - Unknown reversibility → `HARD`, unknown cleanup_cost → `HIGH`
+3. **Reconciliation on every load** - Cached/persisted data re-validates against fail-closed rules
+4. **Budget exhaustion blocks** - `max_steps=0`, `max_tool_calls=0`, or `retries_remaining=0` triggers blocking
+
+**Normalization Metadata:**
+
+Every `GovernanceState` includes `_normalization` tracking:
+- `normalized_at` - Timestamp of normalization
+- `blocking_signals` - Array of detected blocking reasons
+- `reconciliation_applied` - True IFF reconciliation changed derived state
+- `unknown_fields` - Any unrecognized enum values defaulted conservatively
+
+**Why This Matters:**
+
+The normalization layer prevents **split-brain drift** where the UI shows "allowed" while the backend has actually blocked an action. By enforcing fail-closed semantics at the UI ingestion boundary, display state can never be more permissive than actual governance state.
+
 ---
 
 ## What This Is
@@ -201,7 +235,8 @@ m87-governed-swarm/
 │   └── settings.json       # Hooks and permissions
 ├── apps/
 │   ├── api/                # Governance API (FastAPI)
-│   └── ui/                 # Dashboard (static HTML)
+│   └── ui/                 # Dashboard + Governance Observability
+│       └── lib/governance/ # Fail-closed normalization layer
 ├── services/
 │   ├── runner/             # Job executor
 │   ├── notifier/           # Event observer

@@ -70,6 +70,16 @@ m87-governed-swarm/
 │   │   └── app/
 │   │       └── main.py         # FastAPI application
 │   └── ui/                     # Dashboard
+│       ├── lib/
+│       │   ├── governance/     # Governance observability layer
+│       │   │   ├── types.ts        # Canonical types
+│       │   │   ├── normalize.ts    # Fail-closed normalization
+│       │   │   ├── data.ts         # API client
+│       │   │   ├── analytics.ts    # Metrics computation
+│       │   │   ├── persistence.ts  # Serialization
+│       │   │   ├── mock.ts         # Test data
+│       │   │   └── index.ts        # Exports
+│       │   └── __tests__/      # Test files
 │       └── public/
 │           └── index.html      # Single-page app
 │
@@ -128,6 +138,8 @@ m87-governed-swarm/
 | File | Purpose |
 |------|---------|
 | `apps/api/app/main.py` | Governance engine, all policy rules |
+| `apps/ui/lib/governance/normalize.ts` | UI fail-closed normalization boundary |
+| `apps/ui/lib/governance/data.ts` | UI governance data access layer |
 | `packages/adapter-sdk/adapter_sdk/client.py` | SDK for building adapters |
 | `services/runner/app/runner.py` | Job execution logic |
 | `infra/docker-compose.yml` | Service orchestration |
@@ -321,6 +333,16 @@ python3 -m py_compile apps/api/app/main.py
 python3 -m py_compile services/runner/app/runner.py
 ```
 
+### Run UI governance tests
+
+```bash
+cd apps/ui
+npm test                    # Run all tests
+npm run test:watch          # Watch mode
+npm run test:coverage       # With coverage
+npm run typecheck           # Type checking only
+```
+
 ### Run proof tests
 
 ```bash
@@ -475,6 +497,200 @@ The following environment variables can disable governance for emergency rollbac
 - Log loudly on startup if enabled
 - Emit Prometheus metric so it can't be silently left on
 - Fail deployment if set outside dev/staging environment
+
+---
+
+## UI Governance Observability Layer
+
+The `apps/ui/lib/governance/` module provides a fail-closed normalization boundary for all governance data consumed by the UI.
+
+### Architecture
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │          UI Components                   │
+                    │  (only see GovernanceState, never raw)  │
+                    └──────────────────┬──────────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────────┐
+                    │            data.ts                       │
+                    │  fetchGovernanceState()                  │
+                    │  subscribeToGovernance()                 │
+                    │  (makes bypass structurally impossible)  │
+                    └──────────────────┬──────────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────────┐
+                    │         normalize.ts                     │
+                    │  normalizeIncomingGovernance()           │
+                    │  (SINGLE entry point for all data)       │
+                    │  reconcileGovernanceState()              │
+                    │  (re-applies fail-closed on load)        │
+                    └──────────────────┬──────────────────────┘
+                                       │
+           ┌───────────────────────────┼───────────────────────┐
+           │                           │                       │
+┌──────────▼──────────┐   ┌────────────▼───────────┐   ┌──────▼─────┐
+│   persistence.ts    │   │    analytics.ts        │   │  mock.ts   │
+│   (serialize/load)  │   │  (metrics from         │   │ (test data │
+│   (reconciles on    │   │   normalized state)    │   │  normalized)│
+│    every load)      │   └────────────────────────┘   └────────────┘
+└─────────────────────┘
+```
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `types.ts` | Canonical types: `GovernanceState`, `RawGovernanceResponse`, enums |
+| `normalize.ts` | `normalizeIncomingGovernance()` - THE ONLY entry point |
+| `data.ts` | API client that enforces normalization by construction |
+| `analytics.ts` | Metrics: block rate, cleanup cost distribution, budget usage |
+| `persistence.ts` | Serialization with mandatory reconciliation on load |
+| `mock.ts` | Mock data generators that flow through normalization |
+| `index.ts` | Public exports |
+
+### The Normalization Contract
+
+**Rule 1: Single Entry Point**
+
+All governance data MUST pass through `normalizeIncomingGovernance()`:
+
+```typescript
+import { normalizeIncomingGovernance } from "./governance";
+
+// CORRECT: Use the normalization function
+const state = normalizeIncomingGovernance(rawApiResponse);
+
+// WRONG: Never cast or bypass
+const state = rawApiResponse as GovernanceState; // DON'T DO THIS
+```
+
+**Rule 2: Fail-Closed on ANY Blocking Signal**
+
+These conditions ALWAYS force `blocked=true`:
+
+| Signal | Condition | Default Reason |
+|--------|-----------|----------------|
+| Explicit block | `raw.blocked === true` | Uses `raw.blocking_reason` |
+| Reversibility gate | `reversibility_class === "HARD"` | `"REVERSIBILITY_GATE"` |
+| Cleanup cost | `cleanup_cost_v2 === "IMPOSSIBLE"` | `"CLEANUP_IMPOSSIBLE"` |
+| Step budget | `max_steps === 0` (when budget_state provided) | `"STEP_BUDGET"` |
+| Tool budget | `max_tool_calls === 0` | `"TOOL_BUDGET"` |
+| Retry budget | `retries_remaining === 0` | `"RETRIES_EXHAUSTED"` |
+
+**Rule 3: Unknown Enums Default Conservatively**
+
+```typescript
+// Unknown reversibility → HARD (most restrictive)
+const reversibility = REVERSIBILITY_VALUES.includes(raw.reversibility_class)
+  ? raw.reversibility_class
+  : "HARD";
+
+// Unknown cleanup_cost → HIGH (most expensive)
+const cleanupCost = CLEANUP_COST_VALUES.includes(raw.cleanup_cost_v2)
+  ? raw.cleanup_cost_v2
+  : "HIGH";
+```
+
+**Rule 4: Reconciliation on Every Load**
+
+When loading from cache/persistence, `reconcileGovernanceState()` re-applies fail-closed rules:
+
+```typescript
+// persistence.ts always reconciles
+export function loadGovernanceState(key: string): GovernanceState | null {
+  const stored = localStorage.getItem(`gov:${key}`);
+  if (!stored) return null;
+
+  const raw = JSON.parse(stored);
+  const restored = /* restore timestamps */;
+
+  // MANDATORY: Reconcile before returning
+  return reconcileGovernanceState(restored);
+}
+```
+
+### Adding New Blocking Signals
+
+1. Add the signal detection to `detectBlockingSignals()` in `normalize.ts`:
+
+```typescript
+// In detectBlockingSignals()
+if (/* new blocking condition */) {
+  signals.push("NEW_SIGNAL_NAME");
+  if (!reason) reason = "NEW_SIGNAL_NAME";
+}
+```
+
+2. Add a test case in `governance-normalization.test.ts`:
+
+```typescript
+it("should block when NEW_SIGNAL_NAME condition is met", () => {
+  const raw = {
+    blocked: false,
+    // ... condition that triggers NEW_SIGNAL_NAME
+  };
+  const state = normalizeIncomingGovernance(raw);
+  expect(state?.blocked).toBe(true);
+  expect(state?.blocking_reason).toBe("NEW_SIGNAL_NAME");
+});
+```
+
+3. Update `reconcileGovernanceState()` if the signal needs special handling during reconciliation.
+
+### Running Tests
+
+```bash
+cd apps/ui
+
+# Run all governance tests
+npm test
+
+# Run with watch mode
+npm run test:watch
+
+# Run with coverage
+npm run test:coverage
+```
+
+Test files:
+- `lib/__tests__/governance-normalization.test.ts` - Normalization boundary tests
+- `lib/__tests__/governance-style-compliance.test.ts` - Semantic token enforcement
+
+### Style Compliance
+
+Governance UI components MUST use semantic tokens, not hardcoded Tailwind colors:
+
+```typescript
+// CORRECT: Semantic tokens
+className="bg-risk-critical text-foreground"
+className="border-risk-high"
+
+// WRONG: Hardcoded colors
+className="bg-red-500 text-gray-900"  // Will fail style compliance tests
+```
+
+Available semantic tokens:
+- `risk-low`, `risk-medium`, `risk-high`, `risk-critical`, `risk-info`, `risk-purple`
+- `foreground`, `background`, `muted`, `border`, `primary`, `secondary`, `destructive`, `accent`
+
+### Why This Matters
+
+The UI normalization layer prevents **split-brain drift**:
+
+```
+WITHOUT normalization:
+  Backend: blocked=true (budget exhausted)
+  UI cache: blocked=false (stale)
+  User sees: "Allowed" ← DANGEROUS
+
+WITH normalization:
+  Backend: blocked=true
+  UI cache: loaded → reconciled → blocked=true
+  User sees: "Blocked" ← CORRECT
+```
+
+Every time governance data enters the UI—from API, WebSocket, cache, or mock—it passes through normalization. This makes the fail-closed guarantee **structural**, not just a convention.
 
 ---
 
