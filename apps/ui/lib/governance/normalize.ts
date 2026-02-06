@@ -279,6 +279,10 @@ function detectBlockingSignals(
   const signals: string[] = [];
   let reason: BlockingReason | undefined;
 
+  // Check if budget_state was actually provided in raw data
+  // If not, budget-related checks should not trigger (read-only actions don't have budgets)
+  const hasBudgetState = raw.budget_state !== undefined;
+
   // Signal 1: Explicit blocking_reason
   if (raw.blocking_reason) {
     signals.push("blocking_reason_present");
@@ -299,8 +303,9 @@ function detectBlockingSignals(
     }
   }
 
-  // Signal 3: Retries exhausted
+  // Signal 3: Retries exhausted (only if budget_state was provided)
   if (
+    hasBudgetState &&
     budgetState.retries_remaining !== null &&
     budgetState.retries_remaining <= 0
   ) {
@@ -308,14 +313,16 @@ function detectBlockingSignals(
     if (!reason) reason = "RETRY_BUDGET";
   }
 
-  // Signal 4: max_steps === 0 (always blocked)
-  if (budgetState.max_steps === 0) {
+  // Signal 4: max_steps === 0 (only if budget_state was explicitly provided with max_steps=0)
+  // This distinguishes "explicitly set to 0" from "field missing entirely"
+  if (hasBudgetState && raw.budget_state?.max_steps === 0) {
     signals.push("max_steps=0");
     if (!reason) reason = "STEP_BUDGET";
   }
 
   // Signal 5: steps_used >= max_steps (when max_steps > 0)
   if (
+    hasBudgetState &&
     budgetState.max_steps > 0 &&
     budgetState.steps_used >= budgetState.max_steps
   ) {
@@ -323,8 +330,9 @@ function detectBlockingSignals(
     if (!reason) reason = "STEP_BUDGET";
   }
 
-  // Signal 6: tool_calls exhausted
+  // Signal 6: tool_calls exhausted (only if budget_state was provided)
   if (
+    hasBudgetState &&
     budgetState.max_tool_calls > 0 &&
     budgetState.tool_calls_used >= budgetState.max_tool_calls
   ) {
@@ -453,9 +461,17 @@ function reconcileGovernanceState(state: GovernanceState): GovernanceState {
   }));
 
   // Re-check blocking signals
+  // For reconciliation, we must include budget_state to ensure budget checks run
   const rawForBlocking: RawGovernanceResponse = {
     blocked: state.blocked,
     blocking_reason: state.blocking_reason,
+    budget_state: {
+      max_steps: state.budget_state.max_steps,
+      steps_used: state.budget_state.steps_used,
+      max_tool_calls: state.budget_state.max_tool_calls,
+      tool_calls_used: state.budget_state.tool_calls_used,
+      retries_remaining: state.budget_state.retries_remaining,
+    },
   };
   const blockingSignals = detectBlockingSignals(
     rawForBlocking,

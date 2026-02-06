@@ -132,3 +132,54 @@ describe("Governance Style Compliance", () => {
     });
   });
 });
+
+// ---- Optional Broader UI Compliance ----
+// Enable with ENFORCE_UI_TOKEN_COMPLIANCE=1
+
+const ENFORCE_BROAD_COMPLIANCE = process.env.ENFORCE_UI_TOKEN_COMPLIANCE === "1";
+
+describe.skipIf(!ENFORCE_BROAD_COMPLIANCE)("Broad UI Style Compliance", () => {
+  const UI_SRC_PATTERNS = [
+    "../**/*.tsx",
+    "../**/*.jsx",
+    "../**/*.css",
+  ];
+
+  it("should enforce semantic tokens across all UI source files", () => {
+    const glob = require("glob");
+
+    UI_SRC_PATTERNS.forEach((pattern) => {
+      const fullPattern = path.resolve(TEST_DIR, pattern);
+      const files = glob.sync(fullPattern, { nodir: true });
+
+      files.forEach((filePath: string) => {
+        // Skip test files and node_modules
+        if (filePath.includes("__tests__") || filePath.includes("node_modules")) {
+          return;
+        }
+
+        const content = fs.readFileSync(filePath, "utf-8");
+        const violations: string[] = [];
+
+        FORBIDDEN_PATTERNS.forEach((p) => {
+          p.lastIndex = 0;
+          const matches = content.match(p);
+          if (matches) {
+            violations.push(...matches);
+          }
+        });
+
+        if (violations.length > 0) {
+          const uniqueViolations = [...new Set(violations)];
+          throw new Error(
+            `Found ${violations.length} hardcoded color utilities in ${filePath}:\n` +
+              `  Violations: ${uniqueViolations.slice(0, 5).join(", ")}${uniqueViolations.length > 5 ? "..." : ""}\n` +
+              `  Use semantic tokens instead.`
+          );
+        }
+      });
+    });
+
+    expect(true).toBe(true); // If we get here, all files passed
+  });
+});

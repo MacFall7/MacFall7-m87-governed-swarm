@@ -77,3 +77,23 @@ export {
   createRequiresApprovalState,
   generateMockDataset,
 } from "./mock";
+
+// Data Access Layer (mandatory normalization boundary)
+export {
+  configureGovernanceAPI,
+  fetchGovernanceState,
+  fetchGovernanceStateWithCache,
+  fetchGovernanceStates,
+  fetchRecentGovernanceDecisions,
+  subscribeToGovernance,
+  notifyGovernanceUpdate,
+  loadCachedGovernanceStates,
+  loadCachedGovernanceStatesByAgent,
+  createGovernanceHookResult,
+} from "./data";
+export type {
+  GovernanceAPIConfig,
+  FetchResult,
+  UseGovernanceResult,
+  GovernanceUpdateCallback,
+} from "./data";

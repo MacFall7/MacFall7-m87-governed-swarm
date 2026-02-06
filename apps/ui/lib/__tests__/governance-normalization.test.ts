@@ -330,6 +330,24 @@ describe("Governance Normalization Boundary", () => {
       expect(normalized).toBeDefined();
       expect(normalized!.budget_state.percentage_used).toBe(100);
     });
+
+    it("missing budget_state does not trigger false positive blocks", () => {
+      // Read-only actions may not have budget_state at all
+      const raw: RawGovernanceResponse = {
+        proposal_id: "test-no-budget",
+        blocked: false,
+        gate_state: {
+          overall: "allowed",
+        },
+        // budget_state intentionally missing
+      };
+
+      const normalized = normalizeIncomingGovernance(raw);
+
+      expect(normalized).toBeDefined();
+      expect(normalized!.blocked).toBe(false); // Should NOT trigger false positive
+      expect(normalized!.blocking_reason).toBeUndefined();
+    });
   });
 
   // ----------------------------------------------------------------
