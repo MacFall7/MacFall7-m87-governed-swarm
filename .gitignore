@@ -14,3 +14,8 @@ dist/
 data/
 .coverage
 htmlcov/
+
+# Audit evidence (generated, not committed)
+evidence/*.txt
+evidence/*.json
+!evidence/README.md

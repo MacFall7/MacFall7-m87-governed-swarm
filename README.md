@@ -1,6 +1,10 @@
 # M87 Governed Swarm
 
+[![CI](https://github.com/MacFall7/MacFall7-m87-governed-swarm/actions/workflows/ci.yml/badge.svg)](https://github.com/MacFall7/MacFall7-m87-governed-swarm/actions/workflows/ci.yml)
+
 A policy-gated autonomous execution substrate. Agents propose, governance decides, runners execute.
+
+**Proof must be green.** If the CI badge above is red, the governance guarantees documented below are void. Do not trust this system until all tests pass.
 
 ```
 Intent → Proposal → Decision → Job → Execution
@@ -324,7 +328,9 @@ m87-governed-swarm/
 - [Architecture](docs/ARCHITECTURE.md) - System design + Governing Laws
 - [Developer Guide](docs/DEVELOPER.md) - Contributing and extending
 - [API Reference](docs/API.md) - Complete API documentation
-- [Proof Map](docs/PROOF_MAP.md) - Claim → Mechanism → Test mapping (for auditors)
+- [Proof Map](docs/PROOF_MAP.md) - Claim → Mechanism → Test mapping
+- [Auditor Walkthrough](docs/AUDITOR_WALKTHROUGH.md) - One-page security review guide
+- [Contributing](docs/CONTRIBUTING.md) - How to contribute (commit format, governance rules)
 - [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues
 
 ## Verification
