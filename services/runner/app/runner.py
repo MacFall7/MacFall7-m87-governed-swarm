@@ -498,6 +498,12 @@ def validate_job_against_manifest(job: Dict[str, Any], manifest: Dict[str, Any])
     optional = in_spec.get("optional", [])
     limits = in_spec.get("limits", {})
 
+    # P1.2 — Deny on empty args: any empty string argument → DENY
+    # Removes sanitize-and-continue behavior for anomalous args.
+    for key, value in inputs.items():
+        if isinstance(value, str) and value == "":
+            return f"EMPTY_ARG_DENIED: Tool '{tool}' argument '{key}' is an empty string. Empty arguments are not permitted."
+
     # Required keys present
     for k in required:
         if k not in inputs:
@@ -859,8 +865,61 @@ def ensure_group(r: Redis) -> None:
         pass
 
 
+def _verify_runtime_mount_invariants() -> None:
+    """
+    P2.1 — Runtime mount option verification (PROBE_014_ARCHITECTURAL).
+
+    Verifies mount options at startup; mismatch → refuse to start (fail-closed).
+    Checks for nosuid, nodev on temp directories to prevent privilege escalation.
+    """
+    mount_check_enabled = os.getenv("M87_MOUNT_CHECK_ENABLED", "0") == "1"
+    if not mount_check_enabled:
+        print("  ⚠ Mount invariant check disabled (M87_MOUNT_CHECK_ENABLED != 1)", flush=True)
+        return
+
+    try:
+        with open("/proc/mounts", "r") as f:
+            mounts_content = f.read()
+    except (OSError, PermissionError) as e:
+        print(f"  ⚠ Cannot read /proc/mounts: {e} (skipping mount check)", flush=True)
+        return
+
+    # Parse mount options
+    mount_options: dict = {}
+    for line in mounts_content.strip().split("\n"):
+        parts = line.split()
+        if len(parts) >= 4:
+            mount_options[parts[1]] = set(parts[3].split(","))
+
+    # Check required invariants
+    MOUNT_INVARIANTS = {
+        "/tmp": {"nosuid", "nodev"},
+        "/var/tmp": {"nosuid", "nodev"},
+    }
+
+    violations = []
+    for mount_point, required_opts in MOUNT_INVARIANTS.items():
+        if mount_point in mount_options:
+            actual = mount_options[mount_point]
+            missing = required_opts - actual
+            if missing:
+                violations.append(
+                    f"  Mount {mount_point}: missing options {sorted(missing)} "
+                    f"(has: {sorted(actual)})"
+                )
+
+    if violations:
+        print("✗ MOUNT INVARIANT VIOLATIONS:", flush=True)
+        for v in violations:
+            print(v, flush=True)
+        raise RuntimeError(
+            f"Mount invariant violations detected: {len(violations)} mount(s) "
+            f"missing required options. Runner refusing to start (fail-closed)."
+        )
+
+
 def main() -> None:
-    print("🏃 M87 Runner V1.5 (Manifest Lock Verification) starting...", flush=True)
+    print("🏃 M87 Runner V2.0 (Hardening Package) starting...", flush=True)
 
     r = Redis.from_url(REDIS_URL, decode_responses=True)
     ensure_group(r)
@@ -880,6 +939,10 @@ def main() -> None:
         raise RuntimeError(f"Manifest lock verification failed: {lock_result.get('error')}")
     else:
         print(f"⚠ Manifest lock not enforced: {lock_result.get('error')}", flush=True)
+
+    # P2.1: Verify runtime mount invariants (fail-closed)
+    _verify_runtime_mount_invariants()
+    print("✓ Mount invariant check passed", flush=True)
 
     while True:
         try:

@@ -44,6 +44,31 @@ from .governance.reversibility import (
     is_read_only_action,
 )
 
+# V2 Hardening: P0–P2 modules
+from .governance.input_validation import (
+    check_empty_args,
+    check_semantic_truncation,
+    validate_tool_inputs,
+)
+from .governance.virtual_fs_deny import (
+    check_virtual_fs_access,
+    VIRTUAL_FS_DENIED,
+    VIRTUAL_FS_NOT_IN_ALLOWLIST,
+)
+from .governance.glob_validation import (
+    governance_expand_glob,
+    runner_revalidate_glob,
+)
+from .governance.enumeration_limits import (
+    bounded_recursive_enumerate,
+    EnumerationLimits,
+)
+from .governance.quarantine import (
+    quarantine_manager,
+    observability_quarantine,
+    DegradationTier,
+)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -901,11 +926,34 @@ def health():
 
     return {
         "ok": system_ok,
-        "version": "0.3.0",
+        "version": "2.0.0",
         "redis": "connected" if redis_ok else "disconnected",
         "postgres": "connected" if db_health["connected"] else "disconnected",
         "persistence_available": _db_available,
+        "quarantine_tier": quarantine_manager.get_state().current_tier.value,
     }
+
+
+# ---- v2 Quarantine + Degradation Tier endpoints ----
+
+@app.get("/v1/quarantine/status")
+def quarantine_status(x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
+    """Get current quarantine posture and degradation tier."""
+    verify_auth(x_m87_key, "admin:keys")
+    state = quarantine_manager.get_state()
+    return state.to_dict()
+
+
+@app.get("/v1/quarantine/observability")
+def quarantine_observability(
+    agent_id: Optional[str] = None,
+    limit: int = 100,
+    x_m87_key: Optional[str] = Header(None, alias="X-M87-Key"),
+):
+    """Get quarantined agent-supplied metadata (untrusted)."""
+    verify_auth(x_m87_key, "admin:keys")
+    entries = observability_quarantine.get_entries(agent_id=agent_id, limit=limit)
+    return {"entries": entries, "total": len(entries)}
 
 
 @app.get("/v1/agents")
@@ -1020,6 +1068,32 @@ def govern_proposal(
 
     reasons: List[str] = []
     agent = proposal.agent
+
+    # v2 Quarantine Posture: Check if current tier allows this proposal
+    if not quarantine_manager.is_proposal_allowed(list(proposal.effects)):
+        tier_state = quarantine_manager.get_state()
+        reasons.append(
+            f"Degradation Tier {tier_state.current_tier.value} "
+            f"({tier_state.current_tier.name}): proposal effects not permitted."
+        )
+        decision = GovernanceDecision(
+            proposal_id=proposal.proposal_id,
+            decision="DENY",
+            reasons=reasons,
+        )
+        persist_decision(
+            proposal_id=proposal.proposal_id,
+            outcome="DENY",
+            reasons=reasons,
+            decided_by="policy:quarantine_posture",
+        )
+        emit("proposal.denied", {
+            **decision.model_dump(),
+            "agent": agent,
+            "principal_id": auth.principal_id,
+            "quarantine_tier": tier_state.current_tier.value,
+        })
+        return decision
 
     # Rule 1: READ_SECRETS is absolutely forbidden
     if "READ_SECRETS" in proposal.effects:
