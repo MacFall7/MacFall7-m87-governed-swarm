@@ -1,7 +1,7 @@
-# M87 Hardening Package (v1 + v2)
+# M87 Hardening Package (v1 + v2 + v3)
 
-**Version:** 2.0.0
-**Status:** v1 P0–P2 implemented, v2 scaffolding in place
+**Version:** 3.0.0
+**Status:** v1 P0–P2 implemented, v2 scaffolding in place, v3 operational security hardening complete
 
 ## Overview
 
@@ -75,6 +75,85 @@ strong on safety; the v2 roadmap extends into resilience.
 - **Deny codes:** `UNBOUNDED_ENUMERATION`, `ENUMERATION_DEPTH_EXCEEDED`,
   `ENUMERATION_NODE_LIMIT_EXCEEDED`, `ENUMERATION_TIMEOUT`
 
+## v3 Operational Security Hardening
+
+### P0.A — Scoped service credentials
+- **Files:** `apps/api/app/auth/store.py`, `apps/api/app/main.py`, both compose files
+- **What:** Each service (runner, Casey, Jordan, Riley, notifier) gets its own
+  API key with minimal endpoint scopes, effect scopes, and risk caps. The
+  bootstrap key is reserved for admin-only operations. Keys are seeded
+  idempotently at startup via `seed_service_key()`.
+- **Why:** Previously all services shared one key with full admin access. A
+  compromised adapter could hit admin endpoints, approve its own proposals,
+  or submit proposals outside its effect scope.
+- **Scopes:**
+  | Service | endpoint_scopes | effect_scopes | max_risk |
+  |---------|-----------------|---------------|----------|
+  | Runner | `runner:result` | ∅ | 0.0 |
+  | Casey | `proposal:create` | READ_REPO, WRITE_PATCH, RUN_TESTS | 0.6 |
+  | Jordan | `proposal:create` | SEND_NOTIFICATION, BUILD_ARTIFACT, CREATE_PR, READ_REPO | 0.5 |
+  | Riley | `proposal:create` | READ_REPO, BUILD_ARTIFACT, SEND_NOTIFICATION | 0.4 |
+  | Notifier | `admin:emit` | ∅ | 0.0 |
+
+### P0.B — File-based job dispatch (airgapped runner)
+- **Files:** `apps/api/app/job_dispatcher.py`, `services/runner/app/runner.py`,
+  `infra/docker-compose.secure.yml`
+- **What:** Runner supports `M87_DISPATCH_MODE=file`, polling
+  `/dispatch/incoming/` for job envelopes and writing results to
+  `/dispatch/outgoing/`. A separate `job-dispatcher` service bridges Redis
+  to the shared filesystem volume. Atomic writes via temp+rename.
+- **Why:** `docker-compose.secure.yml` used `network_mode: none` but the runner
+  still needed Redis (which requires network). File dispatch makes the airgap
+  real.
+- **Config:** `M87_DISPATCH_MODE=file`, `M87_FILE_INCOMING`, `M87_FILE_OUTGOING`
+
+### P1.A — Argon2id key hashing
+- **Files:** `apps/api/app/auth/models.py`, `apps/api/app/auth/store.py`,
+  `apps/api/requirements.txt`
+- **What:** API keys hashed with Argon2id via `passlib[argon2]` (memory=64 MiB,
+  time=3, parallelism=1). Dual-verify migration: legacy SHA-256 hashes are
+  accepted and transparently rehashed to Argon2id on successful auth.
+- **Why:** SHA-256 is fast and deterministic — vulnerable to rainbow tables and
+  timing attacks. Argon2id is the OWASP-recommended password/key hash.
+- **Migration:** `verify_key_hash()` checks format → routes to Argon2id or
+  SHA-256. `needs_rehash()` detects legacy hashes. `get_by_plaintext()` does
+  transparent rehash on match.
+- **Fallback:** If `passlib[argon2]` is not installed, falls back to SHA-256
+  with a startup warning.
+
+### P1.B — Kill-switch lockdown
+- **Files:** `apps/api/app/main.py` (`_enforce_killswitch_lockdown()`)
+- **What:** `M87_DISABLE_PHASE36_GOVERNANCE=1` is an emergency escape hatch
+  that bypasses Phase 3-6 governance (toxic topology detection, tripwire scan,
+  challenge-response). In prod, this is locked down:
+  - **dev/staging:** Warns but allows.
+  - **prod + default key:** Refuses to boot (`RuntimeError`).
+  - **prod + custom key + no override file:** Warns (key-only authorization).
+  - **prod + custom key + override file present:** Authorized.
+  - **prod + custom key + override path missing:** Refuses to boot.
+- **Why:** Without lockdown, any attacker who can set an env var can silently
+  disable the entire adversarial review layer.
+- **Config:** `M87_ENV`, `M87_BOOTSTRAP_KEY`, `M87_KILLSWITCH_OVERRIDE_PATH`
+
+### P2.A — Per-key rate limiting
+- **Files:** `apps/api/app/governance/rate_limiter.py`, `apps/api/app/main.py`
+- **What:** Redis sorted-set sliding window per `principal_id`. Checked at
+  `/v1/govern/proposal` after auth, before expensive governance evaluation.
+  Returns HTTP 429 with `retry_after` on exceed.
+- **Why:** Without rate limiting, a compromised adapter could flood governance
+  with proposals to exhaust compute or race conditions.
+- **Config:** `M87_RATE_LIMIT_PROPOSALS_PER_MIN` (default: 30)
+
+### P2.B — Pinned Python dependencies
+- **Files:** `apps/api/requirements.in`, `services/runner/requirements.in`
+- **What:** `requirements.in` files listing direct dependencies (human-maintained).
+  `requirements.txt` contains pinned versions. Workflow: edit `.in`, run
+  `pip-compile requirements.in -o requirements.txt`.
+- **Why:** Reproducible builds. Prevents supply-chain drift where a transitive
+  dependency update introduces a vulnerability.
+
+---
+
 ## v2 Scaffolding (3–4 Year Horizon)
 
 ### Quarantine Posture (Option C)
@@ -112,23 +191,54 @@ strong on safety; the v2 roadmap extends into resilience.
 - [x] Any normalization/classification failure → DENY
 - [x] Tool/manifest/contract changes require re-approval
 
-### P0 Gates
+### v1 P0 Gates
 - [x] Glob expansion re-validation test passes (divergent FS view aborts)
 - [x] Virtual FS explicit deny policies present and tested
 
-### P1 Gates
+### v1 P1 Gates
 - [x] Zero-length overwrite semantic deny passes tests
 - [x] Empty args cause DENY (no sanitize)
 
-### P2 Gates
+### v1 P2 Gates
 - [x] Runner refuses start if mount invariants violated
 - [x] Recursive pre-walk caps enforced; deny within time bound
+
+### v3 P0 Gates
+- [x] Each service has its own scoped key (not sharing bootstrap)
+- [x] Runner key can only hit `runner:result` (403 on admin endpoints)
+- [x] Adapter key cannot propose effects outside its scope
+- [x] File-based dispatch creates atomic job envelopes
+- [x] File-based dispatch reads and cleans up result files
+- [x] Secure compose uses `network_mode: none` + file dispatch
+
+### v3 P1 Gates
+- [x] Argon2id hashes produced by default (starts with `$argon2`)
+- [x] Legacy SHA-256 hashes still verified (dual-verify)
+- [x] Legacy hashes transparently rehashed to Argon2id
+- [x] Kill-switch in prod + default key → RuntimeError
+- [x] Kill-switch in prod + custom key + override file → authorized
+- [x] Kill-switch in prod + custom key + missing override → RuntimeError
+- [x] Kill-switch in dev → warns but allows
+
+### v3 P2 Gates
+- [x] Rate limit allows requests under threshold
+- [x] Rate limit denies requests over threshold
+- [x] Rate limits are per-principal (independent)
+- [x] `requirements.in` files present for pip-compile workflow
 
 ### Documentation
 - [x] Layer model included
 - [x] Quarantine posture spec included (scaffolding)
 - [x] Degradation tiers included
+- [x] v3 operational security items documented
 
 ### Audit
 - [x] All new denies have explicit reason codes
 - [x] Deny reasons are stable (contract) for telemetry
+- [x] `.env.example` updated with all new env vars
+
+### Test Counts
+- v1 hardening: 60 tests
+- Existing governance: 76 tests
+- v3 hardening: 40 tests
+- **Total: 176 tests, all passing**
