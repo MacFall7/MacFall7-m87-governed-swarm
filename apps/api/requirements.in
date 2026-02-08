@@ -1,0 +1,10 @@
+# M87 API — direct dependencies (human-maintained)
+# Run: pip-compile requirements.in -o requirements.txt
+fastapi
+uvicorn[standard]
+pydantic
+redis
+sqlalchemy
+psycopg2-binary
+alembic
+passlib[argon2]

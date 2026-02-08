@@ -68,6 +68,7 @@ from .governance.quarantine import (
     observability_quarantine,
     DegradationTier,
 )
+from .governance.rate_limiter import KeyRateLimiter, RateLimitResult
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -78,9 +79,21 @@ app = FastAPI(title="m87-governed-swarm-api", version="0.3.0")
 # ---- Config
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-BOOTSTRAP_KEY = os.getenv("M87_API_KEY", "m87-dev-key-change-me")
+# Auth keys: bootstrap (admin) + per-service scoped keys
+# M87_BOOTSTRAP_KEY is the admin-only key. Services MUST NOT use it.
+# Falls back to M87_API_KEY for backward compatibility.
+BOOTSTRAP_KEY = os.getenv("M87_BOOTSTRAP_KEY", os.getenv("M87_API_KEY", "m87-dev-key-change-me"))
+
+# Per-service keys (each service gets its own scoped key)
+SERVICE_KEY_RUNNER = os.getenv("M87_RUNNER_KEY", "")
+SERVICE_KEY_CASEY = os.getenv("M87_CASEY_KEY", "")
+SERVICE_KEY_JORDAN = os.getenv("M87_JORDAN_KEY", "")
+SERVICE_KEY_RILEY = os.getenv("M87_RILEY_KEY", "")
+SERVICE_KEY_NOTIFIER = os.getenv("M87_NOTIFIER_KEY", "")
+
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
 ENABLE_TEST_ENDPOINTS = os.getenv("M87_ENABLE_TEST_ENDPOINTS", "false").lower() == "true"
+M87_ENV = os.getenv("M87_ENV", "dev")  # dev | staging | prod
 
 
 def load_tool_manifest() -> Dict[str, Any]:
@@ -230,6 +243,9 @@ rdb = Redis.from_url(REDIS_URL, decode_responses=True)
 key_store = KeyStore(rdb)
 key_verifier = KeyVerifier(key_store)
 
+# ---- P2.A: Per-key rate limiter (Redis sliding window)
+rate_limiter = KeyRateLimiter(rdb)
+
 # Stream keys
 EVENT_STREAM = "m87:events"
 JOB_STREAM = "m87:jobs"
@@ -277,6 +293,67 @@ def emit(event_type: str, payload: Dict[str, Any]) -> str:
     """Emit event to Redis stream, returns event ID."""
     event_id = rdb.xadd(EVENT_STREAM, {"type": event_type, "payload": json.dumps(payload)})
     return event_id
+
+
+# ---- P1.B: Kill-switch lockdown
+# In prod, M87_DISABLE_PHASE36_GOVERNANCE=1 is a dangerous emergency-only escape hatch.
+# If enabled in prod, the API refuses to start unless the bootstrap key is explicitly set
+# (not the default) — proving a human operator authorized the override.
+KILLSWITCH_OVERRIDE_PATH = os.getenv("M87_KILLSWITCH_OVERRIDE_PATH", "")
+
+
+def _enforce_killswitch_lockdown() -> None:
+    """
+    P1.B — Refuse to boot in prod if kill-switch is enabled without authorization.
+
+    Rules:
+    - dev/staging: kill-switch allowed (with warning)
+    - prod + kill-switch OFF: no action needed
+    - prod + kill-switch ON: refuse boot UNLESS:
+        1. M87_BOOTSTRAP_KEY is set to a non-default value (proves human set it), AND
+        2. Either M87_KILLSWITCH_OVERRIDE_PATH points to an existing file (signed override)
+           OR M87_ENV is not "prod"
+    """
+    killswitch_on = os.environ.get("M87_DISABLE_PHASE36_GOVERNANCE", "0") == "1"
+
+    if not killswitch_on:
+        return  # Nothing to do
+
+    if M87_ENV != "prod":
+        logger.warning(
+            "KILLSWITCH ACTIVE: M87_DISABLE_PHASE36_GOVERNANCE=1 in %s mode. "
+            "Phase 3-6 governance is BYPASSED.", M87_ENV
+        )
+        return
+
+    # Prod + kill-switch ON: require authorization
+    default_keys = {"m87-dev-key-change-me", "change-this-to-a-long-random-secret", ""}
+    if BOOTSTRAP_KEY in default_keys:
+        raise RuntimeError(
+            "KILLSWITCH_LOCKDOWN: Cannot disable Phase 3-6 governance in prod "
+            "with a default bootstrap key. Set M87_BOOTSTRAP_KEY to a unique secret."
+        )
+
+    if KILLSWITCH_OVERRIDE_PATH:
+        override_path = Path(KILLSWITCH_OVERRIDE_PATH)
+        if override_path.exists():
+            logger.warning(
+                "KILLSWITCH AUTHORIZED: Override file present at %s. "
+                "Phase 3-6 governance is BYPASSED in prod. THIS IS AN EMERGENCY MEASURE.",
+                KILLSWITCH_OVERRIDE_PATH,
+            )
+            return
+        else:
+            raise RuntimeError(
+                f"KILLSWITCH_LOCKDOWN: Override file not found at {KILLSWITCH_OVERRIDE_PATH}. "
+                "Cannot disable Phase 3-6 governance in prod without signed override."
+            )
+
+    # Bootstrap key is non-default but no override file configured
+    logger.warning(
+        "KILLSWITCH AUTHORIZED (key-only): Phase 3-6 governance BYPASSED in prod. "
+        "Configure M87_KILLSWITCH_OVERRIDE_PATH for stronger authorization."
+    )
 
 
 # ---- Startup: Initialize database and seed bootstrap key
@@ -351,7 +428,88 @@ async def startup_event():
     else:
         logger.info(f"Bootstrap key already exists: {existing.key_id}")
 
-    logger.info(f"M87 API ready (db_available={_db_available})")
+    # P0.A: Seed scoped service keys (idempotent)
+    # Each service gets only the scopes it needs — no shared admin key.
+    _SERVICE_KEY_PROFILES = [
+        {
+            "env_key": SERVICE_KEY_RUNNER,
+            "key_id": "key_runner",
+            "principal_type": "runner",
+            "principal_id": "runner",
+            "endpoint_scopes": {"runner:result"},
+            "effect_scopes": set(),
+            "max_risk": 0.0,
+            "description": "Runner: can only report job results",
+        },
+        {
+            "env_key": SERVICE_KEY_CASEY,
+            "key_id": "key_casey",
+            "principal_type": "adapter",
+            "principal_id": "Casey",
+            "endpoint_scopes": {"proposal:create"},
+            "effect_scopes": {"READ_REPO", "WRITE_PATCH", "RUN_TESTS"},
+            "max_risk": 0.6,
+            "description": "Casey adapter: code changes and testing",
+        },
+        {
+            "env_key": SERVICE_KEY_JORDAN,
+            "key_id": "key_jordan",
+            "principal_type": "adapter",
+            "principal_id": "Jordan",
+            "endpoint_scopes": {"proposal:create"},
+            "effect_scopes": {"SEND_NOTIFICATION", "BUILD_ARTIFACT", "CREATE_PR", "READ_REPO"},
+            "max_risk": 0.5,
+            "description": "Jordan adapter: artifacts, notifications, PRs",
+        },
+        {
+            "env_key": SERVICE_KEY_RILEY,
+            "key_id": "key_riley",
+            "principal_type": "adapter",
+            "principal_id": "Riley",
+            "endpoint_scopes": {"proposal:create"},
+            "effect_scopes": {"READ_REPO", "BUILD_ARTIFACT", "SEND_NOTIFICATION"},
+            "max_risk": 0.4,
+            "description": "Riley adapter: analysis and reporting",
+        },
+        {
+            "env_key": SERVICE_KEY_NOTIFIER,
+            "key_id": "key_notifier",
+            "principal_type": "service",
+            "principal_id": "notifier",
+            "endpoint_scopes": {"admin:emit"},
+            "effect_scopes": set(),
+            "max_risk": 0.0,
+            "description": "Notifier: can only emit events",
+        },
+    ]
+
+    seeded_count = 0
+    for profile in _SERVICE_KEY_PROFILES:
+        plaintext = profile["env_key"]
+        if not plaintext:
+            continue  # Not configured — skip (backward compat)
+        record = key_store.seed_service_key(
+            plaintext_key=plaintext,
+            key_id=profile["key_id"],
+            principal_type=profile["principal_type"],
+            principal_id=profile["principal_id"],
+            endpoint_scopes=profile["endpoint_scopes"],
+            effect_scopes=profile["effect_scopes"],
+            max_risk=profile["max_risk"],
+            description=profile["description"],
+        )
+        seeded_count += 1
+        logger.info(f"Service key seeded: {record.key_id} ({record.principal_id})")
+
+    if seeded_count > 0:
+        logger.info(f"Seeded {seeded_count} scoped service key(s)")
+    else:
+        logger.warning("No scoped service keys configured — services may be using bootstrap key")
+
+    # P1.B: Kill-switch lockdown
+    _enforce_killswitch_lockdown()
+
+    logger.info(f"M87 API ready (db_available={_db_available}, env={M87_ENV}, killswitch_locked={'prod' if M87_ENV == 'prod' else 'off'})")
 
 
 # ---- Hard fail-safe helper (Phase 2)
@@ -1044,6 +1202,25 @@ def govern_proposal(
         requested_effects=set(proposal.effects),
         risk_score=proposal.risk_score,
     )
+
+    # P2.A: Per-key rate limiting (after auth, before expensive governance)
+    rl = rate_limiter.check_rate_limit(auth.principal_id)
+    if not rl.allowed:
+        emit("rate_limit.exceeded", {
+            "principal_id": auth.principal_id,
+            "current": rl.current,
+            "limit": rl.limit,
+        })
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "RATE_LIMIT_EXCEEDED",
+                "message": rl.reason,
+                "retry_after": rl.retry_after,
+                "current": rl.current,
+                "limit": rl.limit,
+            },
+        )
 
     # Phase 2: Persist proposal to Postgres (write-through)
     try:

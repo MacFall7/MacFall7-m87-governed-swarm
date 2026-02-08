@@ -19,6 +19,8 @@ from .models import (
     generate_key,
     generate_key_id,
     hash_key,
+    verify_key_hash,
+    needs_rehash,
 )
 
 from .store import KeyStore
@@ -36,6 +38,8 @@ __all__ = [
     "generate_key",
     "generate_key_id",
     "hash_key",
+    "verify_key_hash",
+    "needs_rehash",
     # Store
     "KeyStore",
     # Verifier

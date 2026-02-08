@@ -918,11 +918,107 @@ def _verify_runtime_mount_invariants() -> None:
         )
 
 
+# P0.B: File dispatch mode for airgapped runner (network_mode: none)
+DISPATCH_MODE = os.getenv("M87_DISPATCH_MODE", "redis")  # "redis" or "file"
+FILE_INCOMING = os.getenv("M87_FILE_INCOMING", "/dispatch/incoming")
+FILE_OUTGOING = os.getenv("M87_FILE_OUTGOING", "/dispatch/outgoing")
+
+
+def _file_dispatch_loop(manifest: Dict[str, Any]) -> None:
+    """
+    File-based dispatch loop for airgapped runner.
+
+    Polls incoming/ directory for job envelopes, executes them,
+    and writes results to outgoing/ directory.
+    """
+    from pathlib import Path
+
+    incoming = Path(FILE_INCOMING)
+    outgoing = Path(FILE_OUTGOING)
+    incoming.mkdir(parents=True, exist_ok=True)
+    outgoing.mkdir(parents=True, exist_ok=True)
+
+    print(f"  File dispatch: incoming={incoming}, outgoing={outgoing}", flush=True)
+
+    while True:
+        try:
+            job_files = sorted(incoming.glob("*.json"))
+
+            for job_file in job_files:
+                if job_file.name.startswith("."):
+                    continue
+
+                try:
+                    job = json.loads(job_file.read_text())
+                except (json.JSONDecodeError, OSError) as e:
+                    print(f"  ✗ Bad job file {job_file.name}: {e}", flush=True)
+                    job_file.unlink(missing_ok=True)
+                    continue
+
+                job_id = job.get("job_id", "unknown")
+                proposal_id = job.get("proposal_id", "unknown")
+                print(f"▶ Job {job_id[:8]}... tool={job.get('tool')} (file dispatch)", flush=True)
+
+                job_file.unlink(missing_ok=True)
+
+                err = validate_job_against_manifest(job, manifest)
+                if err:
+                    print(f"  ✗ Manifest reject: {err}", flush=True)
+                    result_data = {
+                        "job_id": job_id,
+                        "proposal_id": proposal_id,
+                        "status": "failed",
+                        "output": {"error": "manifest_reject", "detail": err},
+                    }
+                else:
+                    try:
+                        output = execute_job(job, manifest)
+                        status = "completed" if output.get("exit_code", 0) == 0 else "failed"
+                        print(f"  → {status}", flush=True)
+
+                        completion_artifacts = output.pop("completion_artifacts", None)
+                        envelope_hash = output.pop("envelope_hash", None)
+                        autonomy_budget = output.pop("autonomy_budget", None)
+                        autonomy_usage = output.pop("autonomy_usage", None)
+                        deh_evidence = output.pop("deh_evidence", None)
+
+                        result_data = {
+                            "job_id": job_id,
+                            "proposal_id": proposal_id,
+                            "status": status,
+                            "output": output,
+                            "manifest_hash": manifest.get("_manifest_hash"),
+                            "manifest_version": manifest.get("version"),
+                            "completion_artifacts": completion_artifacts,
+                            "envelope_hash": envelope_hash,
+                            "autonomy_budget": autonomy_budget,
+                            "autonomy_usage": autonomy_usage,
+                            "deh_evidence": deh_evidence,
+                        }
+                    except Exception as e:
+                        print(f"  ✗ Execution error: {e}", flush=True)
+                        result_data = {
+                            "job_id": job_id,
+                            "proposal_id": proposal_id,
+                            "status": "failed",
+                            "output": {"error": "execution_error", "detail": str(e)},
+                        }
+
+                # Write result atomically
+                result_path = outgoing / f"{job_id}.result.json"
+                tmp_path = outgoing / f".{job_id}.result.json.tmp"
+                tmp_path.write_text(json.dumps(result_data, indent=2))
+                tmp_path.rename(result_path)
+
+        except Exception as e:
+            print(f"[ERROR] File dispatch: {e}", flush=True)
+
+        time.sleep(1)
+
+
 def main() -> None:
     print("🏃 M87 Runner V2.0 (Hardening Package) starting...", flush=True)
-
-    r = Redis.from_url(REDIS_URL, decode_responses=True)
-    ensure_group(r)
+    print(f"  Dispatch mode: {DISPATCH_MODE}", flush=True)
 
     manifest = load_manifest(MANIFEST_PATH)
     print(f"✓ Loaded manifest v{manifest.get('version', 'unknown')}", flush=True)
@@ -943,6 +1039,16 @@ def main() -> None:
     # P2.1: Verify runtime mount invariants (fail-closed)
     _verify_runtime_mount_invariants()
     print("✓ Mount invariant check passed", flush=True)
+
+    # P0.B: File dispatch mode — no Redis needed
+    if DISPATCH_MODE == "file":
+        print("✓ Running in file dispatch mode (airgap)", flush=True)
+        _file_dispatch_loop(manifest)
+        return
+
+    # Standard Redis dispatch mode
+    r = Redis.from_url(REDIS_URL, decode_responses=True)
+    ensure_group(r)
 
     while True:
         try:
