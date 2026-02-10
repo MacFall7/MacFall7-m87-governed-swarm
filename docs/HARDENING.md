@@ -77,6 +77,13 @@ strong on safety; the v2 roadmap extends into resilience.
 
 ## Layer 0 Closure — Execution Equivalence
 
+> **STATUS: CLOSED.** Layer 0 is considered a stable contract. Changes to
+> Layer 0 enforcement code require: (1) a new proof artifact run, (2) all
+> TOCTOU probes passing, (3) updated `docs/proofs/layer0.md`. Treat this
+> layer like a kernel ABI: boring, stable, sacred.
+>
+> Proof: `python scripts/layer0_demo.py --json` must return `LAYER_0_ENFORCED`.
+
 Layer 0 previously enforced intent separation (agents can only propose) but
 not execution equivalence (governance and runner agree on filesystem reality).
 The following fixes close that gap.
