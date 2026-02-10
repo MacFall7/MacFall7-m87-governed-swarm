@@ -310,7 +310,15 @@ The following fixes close that gap.
 ### Traceable Demo Run
 - [x] `scripts/layer0_demo.py` exercises all 4 enforcement paths (A–D)
 - [x] Machine-readable JSON trace output (`--json` flag)
+- [x] Build provenance in JSON: `repo_commit`, `branch`, `python_version`, `platform`, `runner_build_id`
 - [x] Verdict: `LAYER_0_ENFORCED` (16/16 checks pass)
+
+### CI Proof Rail (Layer 0)
+```bash
+# Both must pass for a green build:
+python -m pytest apps/api/tests/test_layer0_toctou_probes.py -v
+python scripts/layer0_demo.py --json | python -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d['verdict']=='LAYER_0_ENFORCED' else 1)"
+```
 
 ### Test Counts
 - v1 hardening: 60 tests

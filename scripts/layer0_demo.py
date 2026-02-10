@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import json
 import os
+import platform
+import subprocess
 import sys
 import tempfile
 import time
@@ -43,6 +45,40 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 API_DIR = PROJECT_ROOT / "apps" / "api"
 sys.path.insert(0, str(API_DIR))
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# ---- Build provenance (anti-fake-green)
+
+def _get_git_sha() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(PROJECT_ROOT),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+def _get_git_branch() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(PROJECT_ROOT),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+def _build_provenance() -> dict:
+    return {
+        "repo_commit": _get_git_sha(),
+        "branch": _get_git_branch(),
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "runner_build_id": os.getenv("M87_BUILD_ID", "local"),
+    }
+
 
 # ---- Trace record helpers
 
@@ -332,11 +368,16 @@ def demo_path_d():
 
 def main():
     json_mode = "--json" in sys.argv
+    provenance = _build_provenance()
 
     print("=" * 70)
     print("M87 Layer 0 — Traceable Demo Run")
     print(f"  Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
-    print(f"  Project:   {PROJECT_ROOT}")
+    print(f"  Commit:    {provenance['repo_commit'][:12]}")
+    print(f"  Branch:    {provenance['branch']}")
+    print(f"  Python:    {provenance['python_version']}")
+    print(f"  Platform:  {provenance['platform']}")
+    print(f"  Build ID:  {provenance['runner_build_id']}")
     print("=" * 70)
 
     all_passed = True
@@ -368,6 +409,7 @@ def main():
         output = {
             "demo": "M87 Layer 0 Traceable Demo Run",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "provenance": provenance,
             "total_checks": len(_traces),
             "passed": pass_count,
             "failed": fail_count,
