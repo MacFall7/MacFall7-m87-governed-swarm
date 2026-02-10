@@ -1,6 +1,6 @@
 # M87 Hardening Package (v1 + v2 + v3 + Layer 0 Closure)
 
-**Version:** 3.1.0
+**Version:** 3.2.0
 **Status:** Layer 0 fully closed, v1 P0–P2 implemented, v2 scaffolding, v3 operational security complete
 
 ## Overview
@@ -293,9 +293,29 @@ The following fixes close that gap.
 - [x] Deny reasons are stable (contract) for telemetry
 - [x] `.env.example` updated with all new env vars
 
+### TOCTOU Red-Team Probes
+- [x] Symlink swap after approval → runner detects escape (PROBE 1)
+- [x] Symlink swap to different file inside base → runner detects unapproved path (PROBE 1b)
+- [x] File injection after approval → RUNNER_PATHSET_MISMATCH (PROBE 2)
+- [x] Content replacement at same path → passes (Layer 2 concern, documented) (PROBE 2b)
+- [x] Glob expansion divergence (file added) → GLOB_DIVERGENCE_DETECTED (PROBE 3)
+- [x] File removed between globs → accepted (missing OK, extra not) (PROBE 3b)
+- [x] Glob symlink injection → GLOB_SYMLINK_ESCAPE (PROBE 3c)
+- [x] Directory symlink swap escaping base_dir → abort (PROBE 4)
+- [x] Symlink-to-virtual-FS pivot (/dev/shm, /proc, /sys) → both defenses fire (PROBE 5)
+- [x] Double-fetch race (realpath divergence via overlay) → abort (PROBE 6)
+- [x] Path traversal bypass attempts (../, //, /., trailing /) → denied (PROBE 7)
+- [x] Governance-side traversal bypass → denied (PROBE 7b)
+
+### Traceable Demo Run
+- [x] `scripts/layer0_demo.py` exercises all 4 enforcement paths (A–D)
+- [x] Machine-readable JSON trace output (`--json` flag)
+- [x] Verdict: `LAYER_0_ENFORCED` (16/16 checks pass)
+
 ### Test Counts
 - v1 hardening: 60 tests
 - Existing governance: 76 tests
 - v3 hardening: 40 tests
 - Layer 0 closure: 27 tests
-- **Total: 203 tests, all passing**
+- TOCTOU red-team probes: 20 tests
+- **Total: 223 tests, all passing**
