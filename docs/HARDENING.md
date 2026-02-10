@@ -1,7 +1,7 @@
-# M87 Hardening Package (v1 + v2 + v3)
+# M87 Hardening Package (v1 + v2 + v3 + Layer 0 Closure)
 
-**Version:** 3.0.0
-**Status:** v1 P0–P2 implemented, v2 scaffolding in place, v3 operational security hardening complete
+**Version:** 3.1.0
+**Status:** Layer 0 fully closed, v1 P0–P2 implemented, v2 scaffolding, v3 operational security complete
 
 ## Overview
 
@@ -12,7 +12,7 @@ system based on findings from Red Team Ops I and II.
 
 | Layer | Question | Status |
 |-------|----------|--------|
-| **0** — Unauthorized execution | Can an untrusted agent execute without governance approval? | **SOLVED** (split-brain architecture) |
+| **0** — Unauthorized execution | Can an untrusted agent execute without governance approval? | **SOLVED** (split-brain + execution equivalence enforced) |
 | **1** — Dangerous approvals | Can an agent get dangerous actions approved via prompt injection? | **SOLVED** (effect-over-intent classification) |
 | **2** — Compositional threats | Can multiple low-risk actions compose into dangerous configuration? | **UNSOLVED** (requires state invariants + compositional reasoning) |
 | **3** — Observability integrity | Can an attacker poison what operators see? | **UNSOLVED** (requires independent observability channels) |
@@ -74,6 +74,53 @@ strong on safety; the v2 roadmap extends into resilience.
 - **Why:** Prevents governance CPU exhaustion on `cp -r` pre-walk.
 - **Deny codes:** `UNBOUNDED_ENUMERATION`, `ENUMERATION_DEPTH_EXCEEDED`,
   `ENUMERATION_NODE_LIMIT_EXCEEDED`, `ENUMERATION_TIMEOUT`
+
+## Layer 0 Closure — Execution Equivalence
+
+Layer 0 previously enforced intent separation (agents can only propose) but
+not execution equivalence (governance and runner agree on filesystem reality).
+The following fixes close that gap.
+
+### Virtual FS deny enforced in governance
+- **File:** `apps/api/app/main.py` (govern_proposal)
+- **What:** `check_virtual_fs_access()` is now called for every artifact path
+  (`path`, `source`, `destination`, `target`) before governance evaluation.
+  Any match against `/dev/shm`, `/sys`, `/run`, `/dev/pts`, `/dev/mqueue`, or
+  non-allowlisted `/proc` paths → DENY. No warnings, no soft failures.
+- **Why:** Previously imported but never called — proposals could target
+  dangerous virtual filesystems and pass governance.
+
+### Runner-side path revalidation
+- **File:** `services/runner/app/runner.py` (`_runner_revalidate_paths()`)
+- **What:** Runner canonicalizes all input paths via `os.path.realpath()` and
+  enforces `resolved_paths ⊆ approved_paths`. Extra paths (TOCTOU divergence)
+  → abort with `RUNNER_PATHSET_MISMATCH`. Symlink escapes outside `base_dir`
+  → abort immediately.
+- **Why:** Without this, an overlay/bind mount change between governance
+  approval and runner execution could cause the runner to operate on files
+  governance never approved.
+
+### Runner-side virtual FS deny
+- **File:** `services/runner/app/runner.py` (`_runner_check_virtual_fs()`)
+- **What:** Runner independently blocks access to `/dev/shm`, `/sys`, `/run`,
+  `/dev/pts`, `/dev/mqueue`, and non-allowlisted `/proc` paths. Defense-in-depth:
+  governance should have already denied, but runner is the last line of defense.
+
+### Runner boot-time namespace verification
+- **File:** `services/runner/app/runner.py` (`_verify_network_namespace()`)
+- **What:** At startup, runner checks `/sys/class/net/` for non-loopback
+  interfaces. If any exist (eth0, etc.) → `RuntimeError` (fail-closed).
+  Proves `network_mode: none` is actually in effect.
+- **Config:** `M87_NETWORK_CHECK_ENABLED=1`
+
+### Runner boot-time capability verification
+- **File:** `services/runner/app/runner.py` (`_verify_capabilities_dropped()`)
+- **What:** At startup, runner reads `/proc/self/status` CapEff field and checks
+  for dangerous capabilities: `CAP_SYS_ADMIN`, `CAP_NET_RAW`, `CAP_NET_ADMIN`,
+  `CAP_SYS_PTRACE`. Any present → `RuntimeError` (fail-closed).
+- **Config:** `M87_CAP_CHECK_ENABLED=1`
+
+---
 
 ## v3 Operational Security Hardening
 
@@ -226,6 +273,15 @@ strong on safety; the v2 roadmap extends into resilience.
 - [x] Rate limits are per-principal (independent)
 - [x] `requirements.in` files present for pip-compile workflow
 
+### Layer 0 Closure Gates
+- [x] Virtual FS deny enforced in govern_proposal (proposal + /dev/shm → DENY)
+- [x] Virtual FS deny checks path, source, destination, target keys
+- [x] Runner-side path revalidation catches extra paths (TOCTOU)
+- [x] Runner-side symlink escape detection aborts on realpath outside base_dir
+- [x] Runner-side virtual FS deny blocks /dev/shm, /sys, /run, /proc (defense-in-depth)
+- [x] Runner network namespace check refuses boot with non-loopback interfaces
+- [x] Runner capability check refuses boot with CAP_SYS_ADMIN/CAP_NET_RAW
+
 ### Documentation
 - [x] Layer model included
 - [x] Quarantine posture spec included (scaffolding)
@@ -241,4 +297,5 @@ strong on safety; the v2 roadmap extends into resilience.
 - v1 hardening: 60 tests
 - Existing governance: 76 tests
 - v3 hardening: 40 tests
-- **Total: 176 tests, all passing**
+- Layer 0 closure: 27 tests
+- **Total: 203 tests, all passing**

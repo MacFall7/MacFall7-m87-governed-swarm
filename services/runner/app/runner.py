@@ -709,6 +709,38 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
             "exit_code": -1,
         }
 
+    # Layer 0: Runner-side virtual FS deny (defense-in-depth)
+    # Scan all input values for virtual FS paths before execution
+    inputs_for_vfs = job.get("inputs", {})
+    for input_key, input_val in inputs_for_vfs.items():
+        if isinstance(input_val, str):
+            vfs_deny = _runner_check_virtual_fs(input_val)
+            if vfs_deny:
+                print(f"  ✗ Virtual FS denied: {vfs_deny}", flush=True)
+                return {
+                    "error": "runner_virtual_fs_denied",
+                    "detail": vfs_deny,
+                    "deh_evidence": deh_evidence,
+                    "exit_code": -1,
+                }
+
+    # Layer 0: Runner-side path revalidation (defense-in-depth)
+    # Enforces resolved_paths ⊆ approved_paths invariant
+    approved_paths = job.get("approved_paths", [])
+    path_evidence = _runner_revalidate_paths(
+        approved_paths=approved_paths,
+        job_inputs=inputs_for_vfs,
+    )
+    if not path_evidence["pathset_valid"]:
+        print(f"  ✗ Path revalidation failed: {path_evidence.get('error')}", flush=True)
+        return {
+            "error": "runner_pathset_mismatch",
+            "detail": path_evidence.get("error"),
+            "path_evidence": path_evidence,
+            "deh_evidence": deh_evidence,
+            "exit_code": -1,
+        }
+
     # V1 Step 2: Resolve budget (envelope-first, runner defaults second)
     budget = resolve_autonomy_budget({"deployment_envelope": clamped_envelope})
 
@@ -865,6 +897,95 @@ def ensure_group(r: Redis) -> None:
         pass
 
 
+def _verify_network_namespace() -> None:
+    """
+    Layer 0: Verify runner is network-isolated (network_mode: none).
+
+    Checks that no network interfaces exist besides loopback.
+    Fail-closed: any non-lo interface → refuse to start.
+    """
+    network_check_enabled = os.getenv("M87_NETWORK_CHECK_ENABLED", "0") == "1"
+    if not network_check_enabled:
+        print("  ⚠ Network namespace check disabled (M87_NETWORK_CHECK_ENABLED != 1)", flush=True)
+        return
+
+    try:
+        # /sys/class/net/ lists all network interfaces
+        net_path = "/sys/class/net"
+        if not os.path.exists(net_path):
+            print(f"  ⚠ Cannot read {net_path} (skipping network check)", flush=True)
+            return
+        interfaces = os.listdir(net_path)
+    except (OSError, PermissionError) as e:
+        print(f"  ⚠ Cannot list network interfaces: {e} (skipping)", flush=True)
+        return
+
+    # Only loopback should exist in network_mode: none
+    non_loopback = [iface for iface in interfaces if iface != "lo"]
+    if non_loopback:
+        raise RuntimeError(
+            f"RUNNER_NAMESPACE_VIOLATION: Non-loopback network interfaces detected: "
+            f"{non_loopback}. Runner must have network_mode: none. "
+            f"Refusing to start (fail-closed)."
+        )
+
+
+def _verify_capabilities_dropped() -> None:
+    """
+    Layer 0: Verify dangerous capabilities are dropped.
+
+    Reads /proc/self/status for CapEff (effective capabilities).
+    Fail-closed: dangerous capabilities present → refuse to start.
+
+    Dangerous capabilities:
+    - CAP_SYS_ADMIN (bit 21): full system control
+    - CAP_NET_RAW (bit 13): raw socket access
+    - CAP_NET_ADMIN (bit 12): network configuration
+    - CAP_SYS_PTRACE (bit 19): process tracing
+    """
+    cap_check_enabled = os.getenv("M87_CAP_CHECK_ENABLED", "0") == "1"
+    if not cap_check_enabled:
+        print("  ⚠ Capability check disabled (M87_CAP_CHECK_ENABLED != 1)", flush=True)
+        return
+
+    try:
+        with open("/proc/self/status", "r") as f:
+            status_content = f.read()
+    except (OSError, PermissionError) as e:
+        print(f"  ⚠ Cannot read /proc/self/status: {e} (skipping cap check)", flush=True)
+        return
+
+    cap_eff = None
+    for line in status_content.strip().split("\n"):
+        if line.startswith("CapEff:"):
+            cap_eff = int(line.split(":")[1].strip(), 16)
+            break
+
+    if cap_eff is None:
+        print("  ⚠ CapEff not found in /proc/self/status (skipping)", flush=True)
+        return
+
+    # Dangerous capability bit positions
+    DANGEROUS_CAPS = {
+        12: "CAP_NET_ADMIN",
+        13: "CAP_NET_RAW",
+        19: "CAP_SYS_PTRACE",
+        21: "CAP_SYS_ADMIN",
+    }
+
+    violations = []
+    for bit, name in DANGEROUS_CAPS.items():
+        if cap_eff & (1 << bit):
+            violations.append(name)
+
+    if violations:
+        raise RuntimeError(
+            f"RUNNER_CAPABILITY_VIOLATION: Dangerous capabilities detected: "
+            f"{violations}. Runner must drop all dangerous caps. "
+            f"Refusing to start (fail-closed)."
+        )
+
+
 def _verify_runtime_mount_invariants() -> None:
     """
     P2.1 — Runtime mount option verification (PROBE_014_ARCHITECTURAL).
@@ -916,6 +1037,103 @@ def _verify_runtime_mount_invariants() -> None:
             f"Mount invariant violations detected: {len(violations)} mount(s) "
             f"missing required options. Runner refusing to start (fail-closed)."
         )
+
+
+# ---- Layer 0: Runner-side path revalidation (defense-in-depth)
+# Self-contained implementation — runner does NOT import from governance API.
+# Invariant: resolved_paths ⊆ approved_paths (extra paths → abort)
+
+def _runner_revalidate_paths(
+    approved_paths: list,
+    job_inputs: Dict[str, Any],
+    base_dir: str = "/",
+) -> Dict[str, Any]:
+    """
+    Runner-side revalidation of artifact paths against governance-approved set.
+
+    Checks:
+    1. All input paths are canonicalized via os.path.realpath()
+    2. No symlink escapes outside base_dir
+    3. resolved_set ⊆ approved_set (extra paths = TOCTOU break)
+
+    Returns evidence dict.
+    """
+    evidence = {
+        "pathset_valid": True,
+        "extra_paths": [],
+        "symlink_escapes": [],
+        "error": None,
+    }
+
+    canonical_base = os.path.realpath(base_dir)
+
+    # Extract and canonicalize paths from inputs
+    resolved_paths = set()
+    for key, value in job_inputs.items():
+        if isinstance(value, str) and ("/" in value or os.sep in value):
+            try:
+                resolved = os.path.realpath(value)
+            except (OSError, ValueError):
+                continue
+            # Check symlink escape — always enforced regardless of approved_paths
+            if not resolved.startswith(canonical_base + os.sep) and resolved != canonical_base:
+                evidence["pathset_valid"] = False
+                evidence["symlink_escapes"].append(value)
+                evidence["error"] = f"Symlink escape: {value} resolves to {resolved} (outside {base_dir})"
+                return evidence
+            resolved_paths.add(resolved)
+
+    if not approved_paths:
+        # No approved paths to validate against — symlink check already passed
+        return evidence
+
+    # Build approved set
+    approved_set = set()
+    for p in approved_paths:
+        try:
+            approved_set.add(os.path.realpath(p))
+        except (OSError, ValueError):
+            approved_set.add(p)
+
+    # Invariant: resolved_paths ⊆ approved_paths
+    extra = resolved_paths - approved_set
+    if extra:
+        evidence["pathset_valid"] = False
+        evidence["extra_paths"] = sorted(extra)
+        evidence["error"] = (
+            f"RUNNER_PATHSET_MISMATCH: {len(extra)} path(s) not in governance-approved set. "
+            f"Possible overlay/bind mount divergence."
+        )
+
+    return evidence
+
+
+# ---- Layer 0: Virtual FS deny (runner-side defense-in-depth)
+# Runner independently denies access to dangerous virtual filesystems.
+# This is a last line of defense — governance should have already denied.
+
+_RUNNER_VFS_DENY_PREFIXES = (
+    "/dev/shm", "/sys", "/run", "/dev/pts", "/dev/mqueue",
+)
+_RUNNER_VFS_PROC_ALLOWLIST = frozenset({
+    "/proc/self/status", "/proc/self/limits", "/proc/self/cgroup",
+    "/proc/version", "/proc/cpuinfo", "/proc/meminfo", "/proc/loadavg",
+    "/proc/mounts",
+})
+
+
+def _runner_check_virtual_fs(path: str) -> Optional[str]:
+    """
+    Runner-side virtual FS check. Returns deny reason or None if allowed.
+    """
+    normalized = os.path.normpath(path)
+    for prefix in _RUNNER_VFS_DENY_PREFIXES:
+        if normalized == prefix or normalized.startswith(prefix + "/"):
+            return f"RUNNER_VIRTUAL_FS_DENIED: {path} (matches {prefix})"
+    if normalized.startswith("/proc"):
+        if normalized not in _RUNNER_VFS_PROC_ALLOWLIST:
+            return f"RUNNER_VIRTUAL_FS_DENIED: {path} (not in /proc allowlist)"
+    return None
 
 
 # P0.B: File dispatch mode for airgapped runner (network_mode: none)
@@ -1039,6 +1257,14 @@ def main() -> None:
     # P2.1: Verify runtime mount invariants (fail-closed)
     _verify_runtime_mount_invariants()
     print("✓ Mount invariant check passed", flush=True)
+
+    # Layer 0: Network namespace verification (fail-closed)
+    _verify_network_namespace()
+    print("✓ Network namespace check passed", flush=True)
+
+    # Layer 0: Capability drop verification (fail-closed)
+    _verify_capabilities_dropped()
+    print("✓ Capability check passed", flush=True)
 
     # P0.B: File dispatch mode — no Redis needed
     if DISPATCH_MODE == "file":

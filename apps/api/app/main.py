@@ -1294,6 +1294,39 @@ def govern_proposal(
         })
         return decision
 
+    # Layer 0: Virtual FS deny — scan all artifact paths against explicit deny rules
+    # Fail-closed: if ANY path matches a DENY rule, the entire proposal is denied.
+    if proposal.artifacts:
+        for artifact in proposal.artifacts:
+            for key in ("path", "source", "destination", "target"):
+                artifact_path = artifact.get(key)
+                if artifact_path:
+                    fs_result = check_virtual_fs_access(artifact_path)
+                    if not fs_result.allowed:
+                        reasons.append(
+                            f"Virtual FS denied: {artifact_path} "
+                            f"({fs_result.deny_code}: {fs_result.deny_reason})"
+                        )
+                        decision = GovernanceDecision(
+                            proposal_id=proposal.proposal_id,
+                            decision="DENY",
+                            reasons=reasons,
+                        )
+                        persist_decision(
+                            proposal_id=proposal.proposal_id,
+                            outcome="DENY",
+                            reasons=reasons,
+                            decided_by="policy:virtual_fs_deny",
+                        )
+                        emit("proposal.denied", {
+                            **decision.model_dump(),
+                            "agent": agent,
+                            "principal_id": auth.principal_id,
+                            "deny_code": fs_result.deny_code,
+                            "denied_path": artifact_path,
+                        })
+                        return decision
+
     # Rule 2: Check agent effect scope
     effects_allowed, disallowed_effects = check_agent_effects(agent, proposal.effects)
     if not effects_allowed:
