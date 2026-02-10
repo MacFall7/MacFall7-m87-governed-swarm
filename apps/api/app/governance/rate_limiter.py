@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 import logging
 from typing import Optional, Dict, Any
 
@@ -126,8 +127,11 @@ class KeyRateLimiter:
                 reason=f"Rate limit exceeded: {current_count}/{limit} requests per minute",
             )
 
-        # Add new entry (member must be unique — use timestamp + counter)
-        member = f"{now}:{current_count}"
+        # Add new entry — member must be globally unique.
+        # Using uuid4 nonce prevents collisions under concurrency
+        # (timestamp + counter can collide when two requests arrive
+        # in the same instant with the same ZSET count).
+        member = f"{now}:{uuid.uuid4().hex}"
         pipe2 = self.redis.pipeline()
         pipe2.zadd(key, {member: now})
         # Auto-expire the key after 2x window to prevent leak

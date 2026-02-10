@@ -93,10 +93,12 @@ def bounded_recursive_enumerate(
     # Walk the tree with limit checks at each node
     try:
         for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
-            # Depth check
-            depth = dirpath.replace(root_path, "").count(os.sep)
-            if depth > max_depth_seen:
-                max_depth_seen = depth
+            # Depth check — use relpath to avoid prefix-stripping bugs
+            # (e.g. root="/workspace", dirpath="/workspace/workspace" would
+            # collapse to "" with str.replace, undercounting depth)
+            rel = os.path.relpath(dirpath, root_path)
+            depth = 0 if rel == "." else (rel.count(os.sep) + 1)
+            max_depth_seen = max(max_depth_seen, depth)
 
             if depth > limits.max_depth:
                 return EnumerationResult(

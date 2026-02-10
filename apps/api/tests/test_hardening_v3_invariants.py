@@ -216,26 +216,31 @@ class TestFileJobDispatch:
         data = json.loads(path.read_text())
         assert data["job_id"] == "test-123"
 
-    def test_read_result_returns_none_if_missing(self, tmp_path):
-        """read_result returns None for non-existent result."""
-        from app.job_dispatcher import read_result
+    def test_claim_result_returns_none_if_missing(self, tmp_path):
+        """claim_result returns None for non-existent result."""
+        from app.job_dispatcher import claim_result
         import app.job_dispatcher as jd
 
         jd.RESULT_QUEUE_PATH = tmp_path
-        assert read_result("nonexistent-job") is None
+        assert claim_result("nonexistent-job") is None
 
-    def test_read_result_returns_data_and_cleans_up(self, tmp_path):
-        """read_result reads and deletes the result file."""
-        from app.job_dispatcher import read_result
+    def test_claim_result_returns_data_and_moves_to_inflight(self, tmp_path):
+        """claim_result reads result and moves to inflight (ack-on-success)."""
+        from app.job_dispatcher import claim_result, ack_result
         import app.job_dispatcher as jd
 
         jd.RESULT_QUEUE_PATH = tmp_path
         result_file = tmp_path / "job-abc.result.json"
         result_file.write_text(json.dumps({"status": "completed", "output": {}}))
 
-        data = read_result("job-abc")
+        claimed = claim_result("job-abc")
+        assert claimed is not None
+        data, inflight_path = claimed
         assert data["status"] == "completed"
-        assert not result_file.exists()  # Cleaned up
+        assert not result_file.exists()  # Original removed
+        assert inflight_path.exists()    # Inflight file exists until ack
+        ack_result(inflight_path)
+        assert not inflight_path.exists()  # Cleaned up after ack
 
     def test_write_is_atomic(self, tmp_path):
         """Temp file + rename pattern avoids partial reads."""

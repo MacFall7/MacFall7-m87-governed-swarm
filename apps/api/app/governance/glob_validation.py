@@ -23,6 +23,7 @@ GLOB_DIVERGENCE_DETECTED = "GLOB_DIVERGENCE_DETECTED"
 GLOB_EXPANSION_EMPTY = "GLOB_EXPANSION_EMPTY"
 GLOB_PATH_NOT_CANONICAL = "GLOB_PATH_NOT_CANONICAL"
 GLOB_SYMLINK_ESCAPE = "GLOB_SYMLINK_ESCAPE"
+GLOB_BASE_DIR_NOT_ALLOWED = "GLOB_BASE_DIR_NOT_ALLOWED"
 
 
 @dataclass(frozen=True)
@@ -107,19 +108,23 @@ def governance_expand_glob(
     Returns:
         GlobExpansionResult with approved canonical paths
     """
-    # Validate base_dir
+    # Validate base_dir against allowed set with separator boundary.
+    # startswith("/opt/data") would wrongly accept "/opt/dataexfil" —
+    # require exact match or os.sep boundary.
     if allowed_base_dirs:
         canonical_base = os.path.realpath(base_dir)
-        if not any(
-            canonical_base.startswith(os.path.realpath(d))
-            for d in allowed_base_dirs
-        ):
+
+        def _is_under(base: str, allowed: str) -> bool:
+            allowed = os.path.realpath(allowed)
+            return base == allowed or base.startswith(allowed + os.sep)
+
+        if not any(_is_under(canonical_base, d) for d in allowed_base_dirs):
             return GlobExpansionResult(
                 approved=False,
                 pattern=pattern,
                 base_dir=base_dir,
                 deny_reason=f"Base directory {base_dir} not in allowed set",
-                deny_code=GLOB_PATH_NOT_CANONICAL,
+                deny_code=GLOB_BASE_DIR_NOT_ALLOWED,
             )
 
     # Expand the glob

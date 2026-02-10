@@ -240,8 +240,14 @@ class KeyStore:
         Returns:
             The created KeyRecord
         """
-        key_hash = hash_key(bootstrap_key)
         key_id = "key_bootstrap"
+
+        # Clean up old hash entry (same orphan-prevention as seed_service_key)
+        old_hash = self.redis.get(self._id_path(key_id))
+        if old_hash:
+            self.redis.delete(self._key_path(old_hash))
+
+        key_hash = hash_key(bootstrap_key)
 
         record = KeyRecord(
             key_id=key_id,
@@ -298,6 +304,16 @@ class KeyStore:
         Returns:
             The created/updated KeyRecord
         """
+        # Delete any previous hash entry for this key_id before saving.
+        # Argon2id is non-deterministic, so each call to hash_key() produces
+        # a different hash string. Without cleanup, _save_record() writes a
+        # new m87:keys:{new_hash} entry while the old m87:keys:{old_hash}
+        # entry remains orphaned — growing Redis and confusing scan-based
+        # lookups.
+        old_hash = self.redis.get(self._id_path(key_id))
+        if old_hash:
+            self.redis.delete(self._key_path(old_hash))
+
         key_hash = hash_key(plaintext_key)
 
         record = KeyRecord(

@@ -78,24 +78,52 @@ def write_job_envelope(job: Dict[str, Any]) -> Path:
     return envelope_path
 
 
-def read_result(job_id: str) -> Optional[Dict[str, Any]]:
+def claim_result(job_id: str) -> Optional[tuple[Dict[str, Any], Path]]:
     """
-    Read a result file from the outgoing directory.
+    Atomically claim a result file from the outgoing directory.
 
-    Returns None if not yet available.
+    Returns (data, inflight_path) if available, or None.
+
+    The file is renamed to .inflight before reading — this prevents a
+    retry from re-reading the same result while the post is in progress.
+    The caller MUST call ack_result() on success or nack_result() on
+    failure.
     """
     result_path = RESULT_QUEUE_PATH / f"{job_id}.result.json"
     if not result_path.exists():
         return None
 
+    inflight_path = RESULT_QUEUE_PATH / f"{job_id}.result.inflight.json"
     try:
-        data = json.loads(result_path.read_text())
-        # Remove result file after reading (cleanup)
-        result_path.unlink(missing_ok=True)
-        return data
+        result_path.replace(inflight_path)  # atomic on same filesystem
+    except FileNotFoundError:
+        return None  # raced with another consumer
+
+    try:
+        data = json.loads(inflight_path.read_text())
+        return data, inflight_path
     except (json.JSONDecodeError, OSError) as e:
         logger.error(f"Failed to read result for {job_id}: {e}")
+        # Put it back so next poll retries
+        try:
+            inflight_path.replace(result_path)
+        except OSError:
+            pass
         return None
+
+
+def ack_result(inflight_path: Path) -> None:
+    """Delete the inflight file after successful delivery."""
+    inflight_path.unlink(missing_ok=True)
+
+
+def nack_result(inflight_path: Path, job_id: str) -> None:
+    """Roll back the inflight file so the next poll retries delivery."""
+    result_path = RESULT_QUEUE_PATH / f"{job_id}.result.json"
+    try:
+        inflight_path.replace(result_path)
+    except OSError:
+        pass  # best-effort rollback
 
 
 def post_result_to_api(result: Dict[str, Any]) -> bool:
@@ -164,13 +192,16 @@ def dispatch_loop() -> None:
             # Step 2: Check for results from runner
             completed_jobs = []
             for job_id, dispatched_at in list(pending.items()):
-                result = read_result(job_id)
-                if result:
+                claimed = claim_result(job_id)
+                if claimed:
+                    result, inflight_path = claimed
                     # Post result back to API
                     if post_result_to_api(result):
+                        ack_result(inflight_path)
                         completed_jobs.append(job_id)
                         logger.info(f"Result for {job_id[:8]}... posted to API")
                     else:
+                        nack_result(inflight_path, job_id)
                         logger.warning(f"Failed to post result for {job_id[:8]}... — will retry")
                 elif time.time() - dispatched_at > RESULT_TIMEOUT_SECONDS:
                     # Timeout — post failure
