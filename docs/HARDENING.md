@@ -317,8 +317,10 @@ The following fixes close that gap.
 ```bash
 # Both must pass for a green build:
 python -m pytest apps/api/tests/test_layer0_toctou_probes.py -v
-python scripts/layer0_demo.py --json | python -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d['verdict']=='LAYER_0_ENFORCED' else 1)"
+python scripts/layer0_demo.py --json | python -c \
+  "import sys,json; d=json.load(sys.stdin); assert d['verdict']=='LAYER_0_ENFORCED'; assert d['provenance']['repo_commit']!='unknown'; print('OK:', d['verdict'])"
 ```
+Note: In `--json` mode, human-readable output goes to stderr; JSON goes to stdout (pipe-safe).
 
 ### Test Counts
 - v1 hardening: 60 tests

@@ -83,6 +83,12 @@ def _build_provenance() -> dict:
 # ---- Trace record helpers
 
 _traces: list = []
+_log_dest = sys.stdout  # switched to stderr in --json mode so stdout is pure JSON
+
+
+def _log(msg: str):
+    """Print to the current log destination (stdout or stderr)."""
+    print(msg, file=_log_dest)
 
 
 def trace(path: str, step: str, result: str, detail: dict | None = None):
@@ -96,10 +102,10 @@ def trace(path: str, step: str, result: str, detail: dict | None = None):
     }
     _traces.append(record)
     icon = "\u2713" if result == "PASS" else "\u2717"
-    print(f"  [{icon}] {path} / {step}: {result}")
+    _log(f"  [{icon}] {path} / {step}: {result}")
     if detail:
         for k, v in detail.items():
-            print(f"      {k}: {v}")
+            _log(f"      {k}: {v}")
 
 
 # ===========================================================================
@@ -107,9 +113,9 @@ def trace(path: str, step: str, result: str, detail: dict | None = None):
 # ===========================================================================
 
 def demo_path_a():
-    print("\n" + "=" * 70)
-    print("PATH A: Governance-level virtual FS denial")
-    print("=" * 70)
+    _log("\n" + "=" * 70)
+    _log("PATH A: Governance-level virtual FS denial")
+    _log("=" * 70)
 
     from app.governance.virtual_fs_deny import check_virtual_fs_access
 
@@ -160,7 +166,7 @@ def demo_path_a():
         "path": "/home/user/code/main.py",
     })
 
-    print("  Path A: ALL CHECKS PASSED")
+    _log("  Path A: ALL CHECKS PASSED")
 
 
 # ===========================================================================
@@ -168,9 +174,9 @@ def demo_path_a():
 # ===========================================================================
 
 def demo_path_b():
-    print("\n" + "=" * 70)
-    print("PATH B: Runner-level pathset mismatch")
-    print("=" * 70)
+    _log("\n" + "=" * 70)
+    _log("PATH B: Runner-level pathset mismatch")
+    _log("=" * 70)
 
     from app.governance.glob_validation import (
         governance_expand_glob,
@@ -225,7 +231,7 @@ def demo_path_b():
             "extra_paths": evidence["extra_paths"],
         })
 
-    print("  Path B: ALL CHECKS PASSED")
+    _log("  Path B: ALL CHECKS PASSED")
 
 
 # ===========================================================================
@@ -233,9 +239,9 @@ def demo_path_b():
 # ===========================================================================
 
 def demo_path_c():
-    print("\n" + "=" * 70)
-    print("PATH C: Runner boot refusal (namespace + capability)")
-    print("=" * 70)
+    _log("\n" + "=" * 70)
+    _log("PATH C: Runner boot refusal (namespace + capability)")
+    _log("=" * 70)
 
     from services.runner.app.runner import (
         _verify_network_namespace,
@@ -298,7 +304,7 @@ def demo_path_c():
                 "cap_eff": "0x0",
             })
 
-    print("  Path C: ALL CHECKS PASSED")
+    _log("  Path C: ALL CHECKS PASSED")
 
 
 # ===========================================================================
@@ -306,9 +312,9 @@ def demo_path_c():
 # ===========================================================================
 
 def demo_path_d():
-    print("\n" + "=" * 70)
-    print("PATH D: TOCTOU symlink swap after approval")
-    print("=" * 70)
+    _log("\n" + "=" * 70)
+    _log("PATH D: TOCTOU symlink swap after approval")
+    _log("=" * 70)
 
     from services.runner.app.runner import _runner_revalidate_paths
 
@@ -359,7 +365,7 @@ def demo_path_d():
             "symlink_escapes": evidence["symlink_escapes"],
         })
 
-    print("  Path D: ALL CHECKS PASSED")
+    _log("  Path D: ALL CHECKS PASSED")
 
 
 # ===========================================================================
@@ -367,18 +373,21 @@ def demo_path_d():
 # ===========================================================================
 
 def main():
+    global _log_dest
     json_mode = "--json" in sys.argv
+    if json_mode:
+        _log_dest = sys.stderr  # human-readable → stderr, JSON → stdout
     provenance = _build_provenance()
 
-    print("=" * 70)
-    print("M87 Layer 0 — Traceable Demo Run")
-    print(f"  Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
-    print(f"  Commit:    {provenance['repo_commit'][:12]}")
-    print(f"  Branch:    {provenance['branch']}")
-    print(f"  Python:    {provenance['python_version']}")
-    print(f"  Platform:  {provenance['platform']}")
-    print(f"  Build ID:  {provenance['runner_build_id']}")
-    print("=" * 70)
+    _log("=" * 70)
+    _log("M87 Layer 0 — Traceable Demo Run")
+    _log(f"  Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+    _log(f"  Commit:    {provenance['repo_commit'][:12]}")
+    _log(f"  Branch:    {provenance['branch']}")
+    _log(f"  Python:    {provenance['python_version']}")
+    _log(f"  Platform:  {provenance['platform']}")
+    _log(f"  Build ID:  {provenance['runner_build_id']}")
+    _log("=" * 70)
 
     all_passed = True
     try:
@@ -396,14 +405,14 @@ def main():
     pass_count = sum(1 for t in _traces if t["result"] == "PASS")
     fail_count = sum(1 for t in _traces if t["result"] == "FAIL")
 
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-    print(f"  Total checks: {len(_traces)}")
-    print(f"  Passed:       {pass_count}")
-    print(f"  Failed:       {fail_count}")
-    print(f"  Verdict:      {'LAYER 0 ENFORCED' if all_passed else 'LAYER 0 BROKEN'}")
-    print("=" * 70)
+    _log("\n" + "=" * 70)
+    _log("SUMMARY")
+    _log("=" * 70)
+    _log(f"  Total checks: {len(_traces)}")
+    _log(f"  Passed:       {pass_count}")
+    _log(f"  Failed:       {fail_count}")
+    _log(f"  Verdict:      {'LAYER 0 ENFORCED' if all_passed else 'LAYER 0 BROKEN'}")
+    _log("=" * 70)
 
     if json_mode:
         output = {
@@ -416,7 +425,7 @@ def main():
             "verdict": "LAYER_0_ENFORCED" if all_passed else "LAYER_0_BROKEN",
             "traces": _traces,
         }
-        print("\n--- JSON TRACE ---")
+        # JSON goes to stdout (clean for piping), human output already on stderr
         print(json.dumps(output, indent=2))
 
     sys.exit(0 if all_passed else 1)
