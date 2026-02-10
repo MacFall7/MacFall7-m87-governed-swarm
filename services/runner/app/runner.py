@@ -30,6 +30,10 @@ MANIFEST_LOCK_PATH = os.getenv("M87_MANIFEST_LOCK_PATH", "manifest.lock.json")
 # Phase 5 Step 3: Result payload cap
 MAX_REPORT_BYTES = int(os.getenv("M87_MAX_RUNNER_RESULT_BYTES", "65536"))
 
+# Layer 1: Effect schema version — must match API's EFFECT_SCHEMA_VERSION.
+# Runner rejects jobs with mismatched versions to prevent taxonomy drift.
+RUNNER_EFFECT_SCHEMA_VERSION = "1.0.0"
+
 
 # ---- V1 Governance: Deployment Envelope Hash verification
 def _exclude_none_recursive(obj: Any) -> Any:
@@ -535,6 +539,42 @@ def validate_job_against_manifest(job: Dict[str, Any], manifest: Dict[str, Any])
     return None
 
 
+# ---- Layer 1: Subprocess environment isolation
+# Tools execute via subprocess.run(). Without scrubbing, the child process
+# inherits the runner's full environment — M87_API_KEY, REDIS_URL, POSTGRES
+# passwords, etc. A malicious test or build script could trivially read
+# os.environ and exfiltrate secrets via stdout.
+#
+# _scrubbed_env() returns a copy of os.environ with all governance-sensitive
+# vars removed. Every subprocess.run() call MUST pass env=_scrubbed_env().
+
+_SECRET_ENV_PREFIXES = (
+    "M87_", "REDIS_", "API_", "POSTGRES_", "DATABASE_",
+    "AWS_", "GCP_", "AZURE_", "SECRET_", "TOKEN_",
+)
+
+_SECRET_ENV_EXACT = frozenset({
+    "API_BASE", "API_KEY",
+})
+
+
+def _scrubbed_env() -> Dict[str, str]:
+    """
+    Return a copy of os.environ with governance secrets removed.
+
+    Fail-closed: if in doubt, scrub it. Tools should never need
+    runner infrastructure secrets.
+    """
+    out = {}
+    for k, v in os.environ.items():
+        if any(k.startswith(prefix) for prefix in _SECRET_ENV_PREFIXES):
+            continue
+        if k in _SECRET_ENV_EXACT:
+            continue
+        out[k] = v
+    return out
+
+
 # ---- Tool implementations (the runner is allowed to be boring)
 # V1 Governance: Tools must produce completion artifacts
 
@@ -563,7 +603,8 @@ def tool_echo(message: str, timeout_seconds: int) -> Dict[str, Any]:
             capture_output=True,
             text=True,
             check=True,
-            timeout=timeout_seconds
+            timeout=timeout_seconds,
+            env=_scrubbed_env(),
         )
         output = completed.stdout.strip()
         return {
@@ -591,7 +632,8 @@ def tool_pytest(args: str, timeout_seconds: int) -> Dict[str, Any]:
             cmd,
             capture_output=True,
             text=True,
-            timeout=timeout_seconds
+            timeout=timeout_seconds,
+            env=_scrubbed_env(),
         )
         stdout = (completed.stdout or "")[-8000:]  # cap output
         stderr = (completed.stderr or "")[-8000:]
@@ -674,6 +716,18 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
         return {
             "error": "deh_verification_failed",
             "detail": deh_evidence.get("error"),
+            "deh_evidence": deh_evidence,
+            "exit_code": -1,
+        }
+
+    # Layer 1: Effect schema version verification
+    # Prevents taxonomy drift between API and runner deployments.
+    job_esv = job.get("effect_schema_version")
+    if job_esv and job_esv != RUNNER_EFFECT_SCHEMA_VERSION:
+        print(f"  ✗ Effect schema version mismatch: job={job_esv}, runner={RUNNER_EFFECT_SCHEMA_VERSION}", flush=True)
+        return {
+            "error": "effect_schema_version_mismatch",
+            "detail": f"Job has effect_schema_version '{job_esv}' but runner expects '{RUNNER_EFFECT_SCHEMA_VERSION}'",
             "deh_evidence": deh_evidence,
             "exit_code": -1,
         }

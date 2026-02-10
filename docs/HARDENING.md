@@ -1,7 +1,7 @@
-# M87 Hardening Package (v1 + v2 + v3 + Layer 0 Closure)
+# M87 Hardening Package (v1 + v2 + v3 + Layer 0 + Layer 1)
 
-**Version:** 3.2.0
-**Status:** Layer 0 fully closed, v1 P0–P2 implemented, v2 scaffolding, v3 operational security complete
+**Version:** 3.3.0
+**Status:** Layer 0 + Layer 1 closed, v1 P0–P2 implemented, v2 scaffolding, v3 operational security complete
 
 ## Overview
 
@@ -13,7 +13,7 @@ system based on findings from Red Team Ops I and II.
 | Layer | Question | Status |
 |-------|----------|--------|
 | **0** — Unauthorized execution | Can an untrusted agent execute without governance approval? | **SOLVED** (split-brain + execution equivalence enforced) |
-| **1** — Dangerous approvals | Can an agent get dangerous actions approved via prompt injection? | **SOLVED** (effect-over-intent classification) |
+| **1** — Effect integrity | Can effects drift, leak, or bypass classification? | **SOLVED** (taxonomy alignment, env isolation, schema versioning) |
 | **2** — Compositional threats | Can multiple low-risk actions compose into dangerous configuration? | **UNSOLVED** (requires state invariants + compositional reasoning) |
 | **3** — Observability integrity | Can an attacker poison what operators see? | **UNSOLVED** (requires independent observability channels) |
 | **4** — Operator cognition | Can adversaries induce wrong operator decisions? | **UNSOLVED** (requires decision protocols + tooling) |
@@ -126,6 +126,61 @@ The following fixes close that gap.
   for dangerous capabilities: `CAP_SYS_ADMIN`, `CAP_NET_RAW`, `CAP_NET_ADMIN`,
   `CAP_SYS_PTRACE`. Any present → `RuntimeError` (fail-closed).
 - **Config:** `M87_CAP_CHECK_ENABLED=1`
+
+---
+
+## Layer 1 Closure — Effect Integrity
+
+> **STATUS: CLOSED.** Layer 1 is considered a stable contract. Changes to
+> effect taxonomy, tool allowlists, or subprocess isolation require: (1) all
+> Layer 1 drift probes passing, (2) EFFECT_SCHEMA_VERSION bumped if taxonomy
+> changes, (3) both API and runner versions agree.
+
+Layer 1 ensures that every side-effect the runner can cause is classified,
+versioned, and isolated. Without this, governance can approve effects it
+doesn't understand, tools can read infrastructure secrets, and taxonomy
+drift between API and runner deployments goes undetected.
+
+### Effect taxonomy alignment
+- **Files:** `apps/api/app/governance/effects.py`, `apps/api/app/main.py`
+- **What:** The `EffectTag` enum (13 effects) and the `EffectTag` Literal in
+  `main.py` are now identical. Previously the Literal had only 10 effects
+  (missing `READ_CONFIG`, `COMPUTE`, `OTHER`), meaning proposals with those
+  effects could bypass Pydantic validation silently.
+- **Why:** Taxonomy divergence means governance approves effects that
+  validation doesn't recognize, or rejects effects that are perfectly valid.
+
+### ALLOWED_TOOLS ≡ manifest
+- **File:** `apps/api/app/main.py`
+- **What:** `ALLOWED_TOOLS` and `RunnerTool` Literal now contain exactly
+  `{"echo", "pytest"}` — matching `tool_manifest.json`. Previously they
+  included phantom tools `"git"` and `"build"` that had no manifest entries
+  and no runner implementations.
+- **Why:** A phantom tool in ALLOWED_TOOLS lets governance mint jobs the
+  runner will always reject. A manifest tool missing from ALLOWED_TOOLS
+  blocks legitimate jobs at the API layer.
+
+### Subprocess environment isolation
+- **File:** `services/runner/app/runner.py` (`_scrubbed_env()`)
+- **What:** `tool_echo()` and `tool_pytest()` now call `subprocess.run()`
+  with `env=_scrubbed_env()`, which strips all `M87_*`, `REDIS_*`,
+  `POSTGRES_*`, `DATABASE_*`, `AWS_*`, `GCP_*`, `AZURE_*`, `SECRET_*`,
+  `TOKEN_*` prefixed environment variables.
+- **Why:** Without scrubbing, a malicious test can trivially read
+  `os.environ` and exfiltrate `M87_API_KEY`, `REDIS_URL`, and other
+  infrastructure credentials via stdout. This was the highest-severity
+  gap identified in the Layer 1 audit.
+
+### Effect schema versioning
+- **Files:** `apps/api/app/governance/effects.py` (`EFFECT_SCHEMA_VERSION`),
+  `services/runner/app/runner.py` (`RUNNER_EFFECT_SCHEMA_VERSION`),
+  `apps/api/app/main.py` (job spec stamping)
+- **What:** Every job spec now carries `effect_schema_version: "1.0.0"`.
+  The runner verifies this matches its own `RUNNER_EFFECT_SCHEMA_VERSION`
+  before executing. Mismatched versions → job rejected.
+- **Why:** If the API adds a new effect but the runner hasn't been updated,
+  the runner might execute jobs it can't properly classify. Schema versioning
+  makes this a hard error instead of a silent drift.
 
 ---
 
@@ -329,10 +384,28 @@ python scripts/layer0_demo.py --json | python -c \
 ```
 Note: In `--json` mode, human-readable output goes to stderr; JSON goes to stdout (pipe-safe).
 
+### Layer 1 Effect Drift Probes
+- [x] EffectTag enum and Literal match exactly (PROBE 1)
+- [x] Agent profiles use only canonical effects (PROBE 1b)
+- [x] EXFIL_ADJACENT and READ_ONLY sets are valid and disjoint (PROBE 1c/1d)
+- [x] ALLOWED_TOOLS matches manifest exactly — no phantom tools (PROBE 2)
+- [x] Manifest tools are in ALLOWED_TOOLS — no orphans (PROBE 2b)
+- [x] Manifest effects are canonical EffectTags (PROBE 2c)
+- [x] _scrubbed_env() strips M87_, REDIS_, DATABASE_, POSTGRES_, AWS_, GCP_, AZURE_, SECRET_, TOKEN_ (PROBE 3)
+- [x] tool_echo uses env=_scrubbed_env() (PROBE 3b structural)
+- [x] tool_pytest uses env=_scrubbed_env() (PROBE 3c structural)
+- [x] API and runner EFFECT_SCHEMA_VERSION agree (PROBE 4)
+- [x] Runner rejects mismatched effect_schema_version (PROBE 4b)
+- [x] Runner accepts matching effect_schema_version (PROBE 4c)
+- [x] Every manifest tool has a runner dispatch handler (PROBE 5)
+- [x] Unknown effects map to OTHER (PROBE 6 — fail-closed invariant)
+- [x] Job spec carries effect_schema_version (PROBE 7 structural)
+
 ### Test Counts
 - v1 hardening: 60 tests
 - Existing governance: 76 tests
 - v3 hardening: 40 tests
 - Layer 0 closure: 27 tests
 - TOCTOU red-team probes: 20 tests
-- **Total: 223 tests, all passing**
+- Layer 1 effect drift probes: 27 tests
+- **Total: 250 tests, all passing**

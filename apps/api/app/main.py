@@ -69,6 +69,7 @@ from .governance.quarantine import (
     DegradationTier,
 )
 from .governance.rate_limiter import KeyRateLimiter, RateLimitResult
+from .governance.effects import EFFECT_SCHEMA_VERSION
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -250,8 +251,9 @@ rate_limiter = KeyRateLimiter(rdb)
 EVENT_STREAM = "m87:events"
 JOB_STREAM = "m87:jobs"
 
-# Runner tool allowlist
-ALLOWED_TOOLS = {"echo", "pytest", "git", "build"}
+# Runner tool allowlist — MUST match tool_manifest.json exactly.
+# Adding a tool here without a manifest entry is a Layer 1 violation.
+ALLOWED_TOOLS = {"echo", "pytest"}
 
 
 # ---- V1.3: Agent Profiles (effect scopes + risk thresholds)
@@ -567,19 +569,22 @@ def verify_auth(
 # ---- Minimal in-service models
 EffectTag = Literal[
     "READ_REPO",
+    "READ_SECRETS",
+    "READ_CONFIG",
+    "COMPUTE",
     "WRITE_PATCH",
     "RUN_TESTS",
     "BUILD_ARTIFACT",
-    "NETWORK_CALL",
-    "SEND_NOTIFICATION",
     "CREATE_PR",
     "MERGE",
     "DEPLOY",
-    "READ_SECRETS",
+    "NETWORK_CALL",
+    "SEND_NOTIFICATION",
+    "OTHER",
 ]
 
 Decision = Literal["ALLOW", "DENY", "REQUIRE_HUMAN", "NEED_MORE_EVIDENCE"]
-RunnerTool = Literal["echo", "pytest", "git", "build"]
+RunnerTool = Literal["echo", "pytest"]
 
 
 class Intent(BaseModel):
@@ -911,6 +916,8 @@ def enqueue_job(
         "cleanup_cost": cleanup_cost,
         "budget_multiplier": budget_multiplier,
         "retry_limit": retry_limit,
+        # Layer 1: Effect schema versioning (runner rejects mismatches)
+        "effect_schema_version": EFFECT_SCHEMA_VERSION,
     }
 
     # Phase 2: Persist job to Postgres (write-through)

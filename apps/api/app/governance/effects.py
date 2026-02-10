@@ -3,11 +3,19 @@ Canonical EffectTag taxonomy for M87 governance.
 
 All tool behavior must be declared using these tags.
 Unknown effects are mapped to OTHER and treated as suspicious.
+
+EFFECT_SCHEMA_VERSION is stamped into every governance decision and job spec.
+The runner rejects jobs whose effect_schema_version doesn't match its own,
+preventing silent taxonomy drift between API and runner deployments.
 """
 from __future__ import annotations
 
 from enum import Enum
 from typing import Iterable, Set
+
+# Bump this when adding, removing, or renaming any EffectTag.
+# Runner and API must agree on this version; mismatches are fatal.
+EFFECT_SCHEMA_VERSION = "1.0.0"
 
 
 class EffectTag(str, Enum):
