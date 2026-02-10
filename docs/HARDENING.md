@@ -1,6 +1,6 @@
 # M87 Hardening Package (v1 + v2 + v3 + Layer 0 + Layer 1)
 
-**Version:** 3.3.0
+**Version:** 3.4.0
 **Status:** Layer 0 + Layer 1 closed, v1 P0–P2 implemented, v2 scaffolding, v3 operational security complete
 
 ## Overview
@@ -401,6 +401,19 @@ Note: In `--json` mode, human-readable output goes to stderr; JSON goes to stdou
 - [x] Unknown effects map to OTHER (PROBE 6 — fail-closed invariant)
 - [x] Job spec carries effect_schema_version (PROBE 7 structural)
 
+### Bugbot Regression Probes
+- [x] Enumeration depth bypass: /workspace/workspace/deep counted correctly (PROBE B1)
+- [x] Root depth is 0, single level is 1 (PROBE B1b/B1c)
+- [x] Rate limiter ZSET: same-timestamp concurrent requests produce distinct members (PROBE B2)
+- [x] Rate limiter ZSET: 5 rapid-fire requests all counted (PROBE B2b)
+- [x] Service key reseed: old hash entry cleaned up, no orphans (PROBE B3)
+- [x] Bootstrap key reseed: old hash entry cleaned up (PROBE B3b)
+- [x] allowed_base_dirs: /opt/dataexfil rejected when /opt/data allowed (PROBE B4)
+- [x] allowed_base_dirs: exact match and subdirectory accepted (PROBE B4b/B4c)
+- [x] Result file: failed post rolls back to original location (PROBE B5)
+- [x] Result file: successful post deletes inflight file (PROBE B5b)
+- [x] Result file: double claim prevented by atomic rename (PROBE B5c)
+
 ### Test Counts
 - v1 hardening: 60 tests
 - Existing governance: 76 tests
@@ -408,4 +421,5 @@ Note: In `--json` mode, human-readable output goes to stderr; JSON goes to stdou
 - Layer 0 closure: 27 tests
 - TOCTOU red-team probes: 20 tests
 - Layer 1 effect drift probes: 27 tests
-- **Total: 250 tests, all passing**
+- Bugbot regression probes: 13 tests
+- **Total: 263 tests, all passing**
