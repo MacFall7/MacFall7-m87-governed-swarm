@@ -1,7 +1,7 @@
-# M87 Hardening Package (v1 + v2 + v3 + Layer 0 + Layer 1)
+# M87 Hardening Package (v1 + v2 + v3 + Layer 0 + Layer 1 + Receipts)
 
-**Version:** 3.4.0
-**Status:** Layer 0 + Layer 1 closed, v1 P0–P2 implemented, v2 scaffolding, v3 operational security complete
+**Version:** 3.5.0
+**Status:** Layer 0 + Layer 1 closed, v1 P0–P2 implemented, v2 scaffolding, v3 operational security complete, per-call receipts + offline verification
 
 ## Overview
 
@@ -414,6 +414,53 @@ Note: In `--json` mode, human-readable output goes to stderr; JSON goes to stdou
 - [x] Result file: successful post deletes inflight file (PROBE B5b)
 - [x] Result file: double claim prevented by atomic rename (PROBE B5c)
 
+### Per-Call Receipts + Offline Bundle Verification
+
+Governed Swarm Integration — per-call forensic granularity and offline integrity verification.
+
+**Phase 1: Per-Call Receipt Layer**
+- `governance/call_receipt.py`: Pydantic models (CallReceipt, ProposalRecord, DecisionRecord,
+  ExecutionRecord), ReceiptEmitter with hash-chained monotonic receipts
+- Receipt emission hook in `main.py` govern_proposal() — additive, fail-safe
+- Execution recording hook in `runner.py` execute_job() — additive, fail-safe
+- `governance/schemas/call_receipt.schema.json` for schema validation
+- Effect/posture/decision mapping helpers for M87-to-GBE translation
+
+**Phase 2: Offline Bundle Verification**
+- `governance/verify/offline.py`: OfflineVerifier with 10 checks:
+  SIG_VALID, BUNDLE_HASH_MATCH, SNAPSHOT_PRESENT, ARTIFACTS_COMPLETE,
+  RECEIPTS_CHAIN_VALID, RECEIPTS_MONOTONIC, RECEIPTS_NO_GAPS,
+  BUDGET_COMPLIANCE, CONTRACT_COMPLETE, NO_UNTRUSTED_EXEC
+- `governance/verify/cli.py`: `gbe verify --offline` entry point (exit 0/1)
+- `governance/schemas/offline_verification.schema.json` for report validation
+- Binary PASS/FAIL — no PASS-with-caveats
+
+**Architectural invariants preserved:**
+- Proposal ≠ Execution (receipts are observation-only)
+- Fail-Closed (receipt failure logged, never blocks pipeline)
+- No changes to governance decision pipeline or session risk model
+
+### Per-Call Receipt Tests (CR_01 — CR_07)
+- [x] Schema compliance: receipt validates, version 1.0.0, 64-char hex hashes (CR_01)
+- [x] RESTRICTED redaction: args_redacted=true, hashed paths (CR_02)
+- [x] Emission failure non-blocking: IOError in emitter does not crash pipeline (CR_03)
+- [x] Bundle includes receipts: 3 calls → 3 receipts with chain hash (CR_04)
+- [x] Hash chain integrity: 5 sequential calls form valid chain (CR_05)
+- [x] DENY has null execution: denied receipt finalized with hash (CR_06)
+- [x] Posture and risk captured: ELEVATED posture, risk >= 0.30 (CR_07)
+
+### Offline Verification Tests (OV_01 — OV_10)
+- [x] Valid bundle passes: all 10 checks PASS (OV_01)
+- [x] Tampered artifact: SIG_VALID or BUNDLE_HASH_MATCH FAIL (OV_02)
+- [x] Missing artifact: ARTIFACTS_COMPLETE FAIL (OV_03)
+- [x] Receipt chain gap: RECEIPTS_NO_GAPS FAIL at missing sequence (OV_04)
+- [x] Receipt hash chain break: RECEIPTS_CHAIN_VALID FAIL (OV_05)
+- [x] Budget overflow: BUDGET_COMPLIANCE FAIL (90s vs 60s budget) (OV_06)
+- [x] Missing keyring: SIG_VALID FAIL (not SKIPPED) (OV_07)
+- [x] Known limitations listed: nonce, snapshot, governance (OV_08)
+- [x] UNTRUSTED skill in execution: NO_UNTRUSTED_EXEC FAIL (OV_09)
+- [x] Contract incomplete: CONTRACT_COMPLETE FAIL (missing section) (OV_10)
+
 ### Test Counts
 - v1 hardening: 60 tests
 - Existing governance: 76 tests
@@ -422,4 +469,6 @@ Note: In `--json` mode, human-readable output goes to stderr; JSON goes to stdou
 - TOCTOU red-team probes: 20 tests
 - Layer 1 effect drift probes: 27 tests
 - Bugbot regression probes: 13 tests
-- **Total: 263 tests, all passing**
+- Per-call receipt tests: 17 tests
+- Offline verification tests: 10 tests
+- **Total: 290 tests, all passing**
