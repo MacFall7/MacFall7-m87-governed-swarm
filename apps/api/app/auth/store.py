@@ -15,6 +15,9 @@ from .models import (
     generate_key,
     generate_key_id,
     hash_key,
+    verify_key_hash,
+    needs_rehash,
+    _sha256_hash,
 )
 
 
@@ -31,6 +34,17 @@ class KeyStore:
 
     def __init__(self, redis: Redis):
         self.redis = redis
+
+    @staticmethod
+    def _deserialize_record(data: dict) -> KeyRecord:
+        """Deserialize a Redis-stored dict into a KeyRecord."""
+        data["endpoint_scopes"] = set(data["endpoint_scopes"])
+        data["effect_scopes"] = set(data["effect_scopes"])
+        if data.get("expires_at"):
+            data["expires_at"] = datetime.fromisoformat(data["expires_at"])
+        if data.get("created_at"):
+            data["created_at"] = datetime.fromisoformat(data["created_at"])
+        return KeyRecord(**data)
 
     def _key_path(self, key_hash: str) -> str:
         return f"{self.KEY_PREFIX}{key_hash}"
@@ -93,27 +107,59 @@ class KeyStore:
         )
 
     def get_by_plaintext(self, plaintext: str) -> Optional[KeyRecord]:
-        """Look up key by plaintext (hashes and queries)."""
-        key_hash = hash_key(plaintext)
-        return self.get_by_hash(key_hash)
+        """
+        Look up key by plaintext.
+
+        P1.A dual-verify migration:
+        1. Try Argon2id lookup via key_id index scan (for non-deterministic hashes)
+        2. Try legacy SHA-256 lookup (for backward compat)
+        3. On successful legacy match, transparently rehash to Argon2id
+
+        For seeded keys (bootstrap, service keys), lookup goes through key_id,
+        so this method is mainly for dynamically-created keys.
+        """
+        # Fast path: try legacy SHA-256 lookup (deterministic → O(1))
+        legacy_hash = _sha256_hash(plaintext)
+        record = self.get_by_hash(legacy_hash)
+        if record:
+            # Transparent rehash: upgrade to Argon2id on next save
+            if needs_rehash(record.key_hash):
+                new_hash = hash_key(plaintext)
+                old_hash = record.key_hash
+                record.key_hash = new_hash
+                self._save_record(record)
+                # Clean up old hash key
+                self.redis.delete(self._key_path(old_hash))
+            return record
+
+        # Slow path: scan all keys and verify against Argon2id hashes
+        # This only triggers for Argon2id-hashed keys (non-deterministic)
+        cursor = 0
+        while True:
+            cursor, found = self.redis.scan(cursor, match=f"{self.KEY_PREFIX}*", count=100)
+            for key_path in found:
+                if isinstance(key_path, bytes):
+                    key_path = key_path.decode("utf-8")
+                if "id:" in key_path:
+                    continue
+                data = self.redis.get(key_path)
+                if not data:
+                    continue
+                record_data = json.loads(data)
+                stored_hash = record_data.get("key_hash", "")
+                if verify_key_hash(plaintext, stored_hash):
+                    return self._deserialize_record(record_data)
+            if cursor == 0:
+                break
+
+        return None
 
     def get_by_hash(self, key_hash: str) -> Optional[KeyRecord]:
         """Look up key by hash."""
         data = self.redis.get(self._key_path(key_hash))
         if not data:
             return None
-
-        record_data = json.loads(data)
-        # Convert lists back to sets
-        record_data["endpoint_scopes"] = set(record_data["endpoint_scopes"])
-        record_data["effect_scopes"] = set(record_data["effect_scopes"])
-        # Parse datetime
-        if record_data.get("expires_at"):
-            record_data["expires_at"] = datetime.fromisoformat(record_data["expires_at"])
-        if record_data.get("created_at"):
-            record_data["created_at"] = datetime.fromisoformat(record_data["created_at"])
-
-        return KeyRecord(**record_data)
+        return self._deserialize_record(json.loads(data))
 
     def get_by_id(self, key_id: str) -> Optional[KeyRecord]:
         """Look up key by key_id."""
@@ -165,14 +211,7 @@ class KeyStore:
                     continue
                 data = self.redis.get(key_path)
                 if data:
-                    record_data = json.loads(data)
-                    record_data["endpoint_scopes"] = set(record_data["endpoint_scopes"])
-                    record_data["effect_scopes"] = set(record_data["effect_scopes"])
-                    if record_data.get("expires_at"):
-                        record_data["expires_at"] = datetime.fromisoformat(record_data["expires_at"])
-                    if record_data.get("created_at"):
-                        record_data["created_at"] = datetime.fromisoformat(record_data["created_at"])
-                    keys.append(KeyRecord(**record_data))
+                    keys.append(self._deserialize_record(json.loads(data)))
             if cursor == 0:
                 break
         return keys
@@ -188,8 +227,14 @@ class KeyStore:
         Returns:
             The created KeyRecord
         """
-        key_hash = hash_key(bootstrap_key)
         key_id = "key_bootstrap"
+
+        # Clean up old hash entry (same orphan-prevention as seed_service_key)
+        old_hash = self.redis.get(self._id_path(key_id))
+        if old_hash:
+            self.redis.delete(self._key_path(old_hash))
+
+        key_hash = hash_key(bootstrap_key)
 
         record = KeyRecord(
             key_id=key_id,
@@ -210,7 +255,64 @@ class KeyStore:
             },
             max_risk=1.0,
             enabled=True,
-            description="Bootstrap admin key (from M87_API_KEY env)",
+            description="Bootstrap admin key (from M87_BOOTSTRAP_KEY env)",
+        )
+
+        self._save_record(record)
+        return record
+
+    def seed_service_key(
+        self,
+        plaintext_key: str,
+        key_id: str,
+        principal_type: str,
+        principal_id: str,
+        endpoint_scopes: set,
+        effect_scopes: set = None,
+        max_risk: float = 1.0,
+        description: str = None,
+    ) -> KeyRecord:
+        """
+        Seed a scoped service key (idempotent).
+
+        If a key with the same key_id already exists, it is overwritten
+        to ensure scopes stay current with the codebase definition.
+
+        Args:
+            plaintext_key: The plaintext key (from environment)
+            key_id: Stable identifier for this service key
+            principal_type: Type of principal (adapter, runner, service)
+            principal_id: Identifier for the principal (e.g., "Casey")
+            endpoint_scopes: Allowed endpoints
+            effect_scopes: Allowed effects (for proposals)
+            max_risk: Maximum risk score
+            description: Human-readable description
+
+        Returns:
+            The created/updated KeyRecord
+        """
+        # Delete any previous hash entry for this key_id before saving.
+        # Argon2id is non-deterministic, so each call to hash_key() produces
+        # a different hash string. Without cleanup, _save_record() writes a
+        # new m87:keys:{new_hash} entry while the old m87:keys:{old_hash}
+        # entry remains orphaned — growing Redis and confusing scan-based
+        # lookups.
+        old_hash = self.redis.get(self._id_path(key_id))
+        if old_hash:
+            self.redis.delete(self._key_path(old_hash))
+
+        key_hash = hash_key(plaintext_key)
+
+        record = KeyRecord(
+            key_id=key_id,
+            key_hash=key_hash,
+            principal_type=principal_type,
+            principal_id=principal_id,
+            endpoint_scopes=endpoint_scopes,
+            effect_scopes=effect_scopes or set(),
+            max_risk=max_risk,
+            enabled=True,
+            description=description,
         )
 
         self._save_record(record)

@@ -1,0 +1,4 @@
+# M87 Runner — direct dependencies (human-maintained)
+# Run: pip-compile requirements.in -o requirements.txt
+requests
+redis

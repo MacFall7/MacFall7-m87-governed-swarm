@@ -46,7 +46,16 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - DATABASE_URL=postgresql://m87:${POSTGRES_PASSWORD:-m87-dev-password}@postgres:5432/m87_governance
+      # P0.A: Bootstrap key is admin-only. Services use their own scoped keys.
+      - M87_BOOTSTRAP_KEY=${M87_BOOTSTRAP_KEY:-m87-dev-key-change-me}
       - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
+      # Per-service scoped keys (seeded at startup)
+      - M87_RUNNER_KEY=${M87_RUNNER_KEY:-}
+      - M87_CASEY_KEY=${M87_CASEY_KEY:-}
+      - M87_JORDAN_KEY=${M87_JORDAN_KEY:-}
+      - M87_RILEY_KEY=${M87_RILEY_KEY:-}
+      - M87_NOTIFIER_KEY=${M87_NOTIFIER_KEY:-}
+      - M87_ENV=${M87_ENV:-dev}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       - M87_ENABLE_TEST_ENDPOINTS=${M87_ENABLE_TEST_ENDPOINTS:-false}
       - M87_TOOL_MANIFEST_PATH=/app/tool_manifest.json
@@ -71,7 +80,8 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - API_BASE=http://api:8000
-      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
+      # P0.A: Runner uses its own scoped key (runner:result only)
+      - M87_API_KEY=${M87_RUNNER_KEY:-${M87_API_KEY:-m87-dev-key-change-me}}
       - M87_TOOL_MANIFEST_PATH=app/tool_manifest.json
       - M87_MANIFEST_LOCK_PATH=manifest.lock.json
       - M87_MAX_RUNNER_RESULT_BYTES=${M87_MAX_RUNNER_RESULT_BYTES:-65536}
@@ -89,7 +99,8 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - API_BASE=http://api:8000
-      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
+      # P0.A: Notifier uses its own scoped key (admin:emit only)
+      - M87_API_KEY=${M87_NOTIFIER_KEY:-${M87_API_KEY:-m87-dev-key-change-me}}
       - WEBHOOK_URL=${WEBHOOK_URL:-}
     depends_on:
       api:
@@ -119,7 +130,8 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - M87_API_BASE=http://api:8000
-      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
+      # P0.A: Casey uses its own scoped key (proposal:create + Casey effects only)
+      - M87_API_KEY=${M87_CASEY_KEY:-${M87_API_KEY:-m87-dev-key-change-me}}
       - POLL_INTERVAL=5
       - LOG_LEVEL=INFO
     depends_on:
@@ -136,7 +148,8 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - M87_API_BASE=http://api:8000
-      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
+      # P0.A: Jordan uses its own scoped key (proposal:create + Jordan effects only)
+      - M87_API_KEY=${M87_JORDAN_KEY:-${M87_API_KEY:-m87-dev-key-change-me}}
       - POLL_INTERVAL=5
       - LOG_LEVEL=INFO
     depends_on:
@@ -153,7 +166,8 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - M87_API_BASE=http://api:8000
-      - M87_API_KEY=${M87_API_KEY:-m87-dev-key-change-me}
+      # P0.A: Riley uses its own scoped key (proposal:create + Riley effects only)
+      - M87_API_KEY=${M87_RILEY_KEY:-${M87_API_KEY:-m87-dev-key-change-me}}
       - POLL_INTERVAL=5
       - LOG_LEVEL=INFO
     depends_on:

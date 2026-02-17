@@ -1,0 +1,101 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://m87.studio/schemas/call_receipt.schema.json",
+  "title": "M87 Call Receipt",
+  "description": "Sealed artifact for a single tool invocation through the governance pipeline.",
+  "type": "object",
+  "required": [
+    "receipt_version",
+    "sequence_number",
+    "session_id",
+    "timestamp_utc",
+    "proposal",
+    "decision",
+    "previous_receipt_hash"
+  ],
+  "properties": {
+    "receipt_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "sequence_number": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "timestamp_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "previous_receipt_hash": {
+      "type": ["string", "null"],
+      "description": "SHA-256 of previous receipt. Null for sequence 0."
+    },
+    "proposal": {
+      "type": "object",
+      "required": ["proposal_hash", "tool", "effect_class", "args_hash"],
+      "properties": {
+        "proposal_hash": { "type": "string" },
+        "tool": { "type": "string" },
+        "operation": { "type": ["string", "null"] },
+        "args_hash": { "type": "string" },
+        "args_redacted": { "type": "boolean", "default": false },
+        "resource_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "effect_class": {
+          "type": "string",
+          "enum": [
+            "READ_ONLY", "WRITE_LOCAL", "MODEL_INFERENCE",
+            "EXTERNAL_READ", "NETWORK_TRANSMIT", "PERMISSION_CHANGE",
+            "INTEGRATION_WIRE", "SHELL_EXEC", "SCHEMA_MODIFY"
+          ]
+        },
+        "reversibility_class": {
+          "type": ["string", "null"],
+          "enum": ["REVERSIBLE", "PARTIALLY_REVERSIBLE", "IRREVERSIBLE", null]
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "required": ["outcome", "posture_at_decision"],
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "DENY", "PASS_TO_REVIEW", "SKIP_FILE", "FLAG_FOR_REVIEW",
+            "TRUNCATE_AND_FLAG", "INVALIDATE_BUNDLE",
+            "ESCALATE_TO_LOCKDOWN", "FREEZE", "APPROVE"
+          ]
+        },
+        "posture_at_decision": {
+          "type": "string",
+          "enum": ["NORMAL", "ELEVATED", "LOCKDOWN", "HARD_TERMINATE"]
+        },
+        "risk_delta": { "type": ["number", "null"] },
+        "cumulative_risk": { "type": ["number", "null"] },
+        "reason": { "type": ["string", "null"] },
+        "policy_path": { "type": ["string", "null"] }
+      }
+    },
+    "execution": {
+      "type": ["object", "null"],
+      "properties": {
+        "result_hash": { "type": "string" },
+        "result_size_bytes": { "type": "integer" },
+        "execution_ms": { "type": "number" },
+        "exit_code": { "type": ["integer", "null"] },
+        "truncated": { "type": "boolean", "default": false }
+      }
+    },
+    "receipt_hash": {
+      "type": ["string", "null"],
+      "description": "SHA-256 of this receipt excluding this field."
+    }
+  },
+  "additionalProperties": false
+}

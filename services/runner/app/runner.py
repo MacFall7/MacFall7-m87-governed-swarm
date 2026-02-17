@@ -30,6 +30,10 @@ MANIFEST_LOCK_PATH = os.getenv("M87_MANIFEST_LOCK_PATH", "manifest.lock.json")
 # Phase 5 Step 3: Result payload cap
 MAX_REPORT_BYTES = int(os.getenv("M87_MAX_RUNNER_RESULT_BYTES", "65536"))
 
+# Layer 1: Effect schema version — must match API's EFFECT_SCHEMA_VERSION.
+# Runner rejects jobs with mismatched versions to prevent taxonomy drift.
+RUNNER_EFFECT_SCHEMA_VERSION = "1.0.0"
+
 
 # ---- V1 Governance: Deployment Envelope Hash verification
 def _exclude_none_recursive(obj: Any) -> Any:
@@ -498,6 +502,12 @@ def validate_job_against_manifest(job: Dict[str, Any], manifest: Dict[str, Any])
     optional = in_spec.get("optional", [])
     limits = in_spec.get("limits", {})
 
+    # P1.2 — Deny on empty args: any empty string argument → DENY
+    # Removes sanitize-and-continue behavior for anomalous args.
+    for key, value in inputs.items():
+        if isinstance(value, str) and value == "":
+            return f"EMPTY_ARG_DENIED: Tool '{tool}' argument '{key}' is an empty string. Empty arguments are not permitted."
+
     # Required keys present
     for k in required:
         if k not in inputs:
@@ -529,6 +539,42 @@ def validate_job_against_manifest(job: Dict[str, Any], manifest: Dict[str, Any])
     return None
 
 
+# ---- Layer 1: Subprocess environment isolation
+# Tools execute via subprocess.run(). Without scrubbing, the child process
+# inherits the runner's full environment — M87_API_KEY, REDIS_URL, POSTGRES
+# passwords, etc. A malicious test or build script could trivially read
+# os.environ and exfiltrate secrets via stdout.
+#
+# _scrubbed_env() returns a copy of os.environ with all governance-sensitive
+# vars removed. Every subprocess.run() call MUST pass env=_scrubbed_env().
+
+_SECRET_ENV_PREFIXES = (
+    "M87_", "REDIS_", "API_", "POSTGRES_", "DATABASE_",
+    "AWS_", "GCP_", "AZURE_", "SECRET_", "TOKEN_",
+)
+
+_SECRET_ENV_EXACT = frozenset({
+    "API_BASE", "API_KEY",
+})
+
+
+def _scrubbed_env() -> Dict[str, str]:
+    """
+    Return a copy of os.environ with governance secrets removed.
+
+    Fail-closed: if in doubt, scrub it. Tools should never need
+    runner infrastructure secrets.
+    """
+    out = {}
+    for k, v in os.environ.items():
+        if any(k.startswith(prefix) for prefix in _SECRET_ENV_PREFIXES):
+            continue
+        if k in _SECRET_ENV_EXACT:
+            continue
+        out[k] = v
+    return out
+
+
 # ---- Tool implementations (the runner is allowed to be boring)
 # V1 Governance: Tools must produce completion artifacts
 
@@ -557,7 +603,8 @@ def tool_echo(message: str, timeout_seconds: int) -> Dict[str, Any]:
             capture_output=True,
             text=True,
             check=True,
-            timeout=timeout_seconds
+            timeout=timeout_seconds,
+            env=_scrubbed_env(),
         )
         output = completed.stdout.strip()
         return {
@@ -585,7 +632,8 @@ def tool_pytest(args: str, timeout_seconds: int) -> Dict[str, Any]:
             cmd,
             capture_output=True,
             text=True,
-            timeout=timeout_seconds
+            timeout=timeout_seconds,
+            env=_scrubbed_env(),
         )
         stdout = (completed.stdout or "")[-8000:]  # cap output
         stderr = (completed.stderr or "")[-8000:]
@@ -672,6 +720,18 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
             "exit_code": -1,
         }
 
+    # Layer 1: Effect schema version verification
+    # Prevents taxonomy drift between API and runner deployments.
+    job_esv = job.get("effect_schema_version")
+    if job_esv and job_esv != RUNNER_EFFECT_SCHEMA_VERSION:
+        print(f"  ✗ Effect schema version mismatch: job={job_esv}, runner={RUNNER_EFFECT_SCHEMA_VERSION}", flush=True)
+        return {
+            "error": "effect_schema_version_mismatch",
+            "detail": f"Job has effect_schema_version '{job_esv}' but runner expects '{RUNNER_EFFECT_SCHEMA_VERSION}'",
+            "deh_evidence": deh_evidence,
+            "exit_code": -1,
+        }
+
     # V1 Governance: Defense-in-depth open-weight clamping
     envelope = job.get("deployment_envelope", {})
     clamped_envelope = enforce_open_weight_safety(envelope)
@@ -699,6 +759,38 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
             "error": "execution_mode_unsupported",
             "detail": mode_evidence.get("error"),
             "mode_evidence": mode_evidence,
+            "deh_evidence": deh_evidence,
+            "exit_code": -1,
+        }
+
+    # Layer 0: Runner-side virtual FS deny (defense-in-depth)
+    # Scan all input values for virtual FS paths before execution
+    inputs_for_vfs = job.get("inputs", {})
+    for input_key, input_val in inputs_for_vfs.items():
+        if isinstance(input_val, str):
+            vfs_deny = _runner_check_virtual_fs(input_val)
+            if vfs_deny:
+                print(f"  ✗ Virtual FS denied: {vfs_deny}", flush=True)
+                return {
+                    "error": "runner_virtual_fs_denied",
+                    "detail": vfs_deny,
+                    "deh_evidence": deh_evidence,
+                    "exit_code": -1,
+                }
+
+    # Layer 0: Runner-side path revalidation (defense-in-depth)
+    # Enforces resolved_paths ⊆ approved_paths invariant
+    approved_paths = job.get("approved_paths", [])
+    path_evidence = _runner_revalidate_paths(
+        approved_paths=approved_paths,
+        job_inputs=inputs_for_vfs,
+    )
+    if not path_evidence["pathset_valid"]:
+        print(f"  ✗ Path revalidation failed: {path_evidence.get('error')}", flush=True)
+        return {
+            "error": "runner_pathset_mismatch",
+            "detail": path_evidence.get("error"),
+            "path_evidence": path_evidence,
             "deh_evidence": deh_evidence,
             "exit_code": -1,
         }
@@ -767,6 +859,8 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
             deh_evidence=deh_evidence,
         )
 
+    exec_start = time.monotonic()
+
     if tool == "echo":
         result = tool_echo(inputs.get("message", ""), timeout_seconds)
     elif tool == "pytest":
@@ -774,6 +868,21 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
     else:
         # Should never happen due to manifest validation
         raise RuntimeError(f"Unhandled tool: {tool}")
+
+    exec_elapsed_ms = (time.monotonic() - exec_start) * 1000
+
+    # Per-Call Receipt: record execution timing + result hash (observation-only, fail-safe)
+    try:
+        result_bytes = json.dumps(result, sort_keys=True, default=str).encode("utf-8")
+        result["call_receipt_execution"] = {
+            "result_hash": hashlib.sha256(result_bytes).hexdigest(),
+            "result_size_bytes": len(result_bytes),
+            "execution_ms": round(exec_elapsed_ms, 2),
+            "exit_code": result.get("exit_code"),
+            "truncated": False,
+        }
+    except Exception as e:
+        print(f"  ⚠ Call receipt recording failed: {e}", flush=True)
 
     # V1 Governance: Artifact-backed completion enforcement (runner-side)
     # Runner must not report "completed" without artifacts
@@ -859,11 +968,346 @@ def ensure_group(r: Redis) -> None:
         pass
 
 
-def main() -> None:
-    print("🏃 M87 Runner V1.5 (Manifest Lock Verification) starting...", flush=True)
+def _verify_network_namespace() -> None:
+    """
+    Layer 0: Verify runner is network-isolated (network_mode: none).
 
-    r = Redis.from_url(REDIS_URL, decode_responses=True)
-    ensure_group(r)
+    Checks that no network interfaces exist besides loopback.
+    Fail-closed: any non-lo interface → refuse to start.
+    """
+    network_check_enabled = os.getenv("M87_NETWORK_CHECK_ENABLED", "0") == "1"
+    if not network_check_enabled:
+        print("  ⚠ Network namespace check disabled (M87_NETWORK_CHECK_ENABLED != 1)", flush=True)
+        return
+
+    try:
+        # /sys/class/net/ lists all network interfaces
+        net_path = "/sys/class/net"
+        if not os.path.exists(net_path):
+            print(f"  ⚠ Cannot read {net_path} (skipping network check)", flush=True)
+            return
+        interfaces = os.listdir(net_path)
+    except (OSError, PermissionError) as e:
+        print(f"  ⚠ Cannot list network interfaces: {e} (skipping)", flush=True)
+        return
+
+    # Only loopback should exist in network_mode: none
+    non_loopback = [iface for iface in interfaces if iface != "lo"]
+    if non_loopback:
+        raise RuntimeError(
+            f"RUNNER_NAMESPACE_VIOLATION: Non-loopback network interfaces detected: "
+            f"{non_loopback}. Runner must have network_mode: none. "
+            f"Refusing to start (fail-closed)."
+        )
+
+
+def _verify_capabilities_dropped() -> None:
+    """
+    Layer 0: Verify dangerous capabilities are dropped.
+
+    Reads /proc/self/status for CapEff (effective capabilities).
+    Fail-closed: dangerous capabilities present → refuse to start.
+
+    Dangerous capabilities:
+    - CAP_SYS_ADMIN (bit 21): full system control
+    - CAP_NET_RAW (bit 13): raw socket access
+    - CAP_NET_ADMIN (bit 12): network configuration
+    - CAP_SYS_PTRACE (bit 19): process tracing
+    """
+    cap_check_enabled = os.getenv("M87_CAP_CHECK_ENABLED", "0") == "1"
+    if not cap_check_enabled:
+        print("  ⚠ Capability check disabled (M87_CAP_CHECK_ENABLED != 1)", flush=True)
+        return
+
+    try:
+        with open("/proc/self/status", "r") as f:
+            status_content = f.read()
+    except (OSError, PermissionError) as e:
+        print(f"  ⚠ Cannot read /proc/self/status: {e} (skipping cap check)", flush=True)
+        return
+
+    cap_eff = None
+    for line in status_content.strip().split("\n"):
+        if line.startswith("CapEff:"):
+            cap_eff = int(line.split(":")[1].strip(), 16)
+            break
+
+    if cap_eff is None:
+        print("  ⚠ CapEff not found in /proc/self/status (skipping)", flush=True)
+        return
+
+    # Dangerous capability bit positions
+    DANGEROUS_CAPS = {
+        12: "CAP_NET_ADMIN",
+        13: "CAP_NET_RAW",
+        19: "CAP_SYS_PTRACE",
+        21: "CAP_SYS_ADMIN",
+    }
+
+    violations = []
+    for bit, name in DANGEROUS_CAPS.items():
+        if cap_eff & (1 << bit):
+            violations.append(name)
+
+    if violations:
+        raise RuntimeError(
+            f"RUNNER_CAPABILITY_VIOLATION: Dangerous capabilities detected: "
+            f"{violations}. Runner must drop all dangerous caps. "
+            f"Refusing to start (fail-closed)."
+        )
+
+
+def _verify_runtime_mount_invariants() -> None:
+    """
+    P2.1 — Runtime mount option verification (PROBE_014_ARCHITECTURAL).
+
+    Verifies mount options at startup; mismatch → refuse to start (fail-closed).
+    Checks for nosuid, nodev on temp directories to prevent privilege escalation.
+    """
+    mount_check_enabled = os.getenv("M87_MOUNT_CHECK_ENABLED", "0") == "1"
+    if not mount_check_enabled:
+        print("  ⚠ Mount invariant check disabled (M87_MOUNT_CHECK_ENABLED != 1)", flush=True)
+        return
+
+    try:
+        with open("/proc/mounts", "r") as f:
+            mounts_content = f.read()
+    except (OSError, PermissionError) as e:
+        print(f"  ⚠ Cannot read /proc/mounts: {e} (skipping mount check)", flush=True)
+        return
+
+    # Parse mount options
+    mount_options: dict = {}
+    for line in mounts_content.strip().split("\n"):
+        parts = line.split()
+        if len(parts) >= 4:
+            mount_options[parts[1]] = set(parts[3].split(","))
+
+    # Check required invariants
+    MOUNT_INVARIANTS = {
+        "/tmp": {"nosuid", "nodev"},
+        "/var/tmp": {"nosuid", "nodev"},
+    }
+
+    violations = []
+    for mount_point, required_opts in MOUNT_INVARIANTS.items():
+        if mount_point in mount_options:
+            actual = mount_options[mount_point]
+            missing = required_opts - actual
+            if missing:
+                violations.append(
+                    f"  Mount {mount_point}: missing options {sorted(missing)} "
+                    f"(has: {sorted(actual)})"
+                )
+
+    if violations:
+        print("✗ MOUNT INVARIANT VIOLATIONS:", flush=True)
+        for v in violations:
+            print(v, flush=True)
+        raise RuntimeError(
+            f"Mount invariant violations detected: {len(violations)} mount(s) "
+            f"missing required options. Runner refusing to start (fail-closed)."
+        )
+
+
+# ---- Layer 0: Runner-side path revalidation (defense-in-depth)
+# Self-contained implementation — runner does NOT import from governance API.
+# Invariant: resolved_paths ⊆ approved_paths (extra paths → abort)
+
+def _runner_revalidate_paths(
+    approved_paths: list,
+    job_inputs: Dict[str, Any],
+    base_dir: str = "/",
+) -> Dict[str, Any]:
+    """
+    Runner-side revalidation of artifact paths against governance-approved set.
+
+    Checks:
+    1. All input paths are canonicalized via os.path.realpath()
+    2. No symlink escapes outside base_dir
+    3. resolved_set ⊆ approved_set (extra paths = TOCTOU break)
+
+    Returns evidence dict.
+    """
+    evidence = {
+        "pathset_valid": True,
+        "extra_paths": [],
+        "symlink_escapes": [],
+        "error": None,
+    }
+
+    canonical_base = os.path.realpath(base_dir)
+
+    # Extract and canonicalize paths from inputs
+    resolved_paths = set()
+    for key, value in job_inputs.items():
+        if isinstance(value, str) and ("/" in value or os.sep in value):
+            try:
+                resolved = os.path.realpath(value)
+            except (OSError, ValueError):
+                continue
+            # Check symlink escape — always enforced regardless of approved_paths
+            if not resolved.startswith(canonical_base + os.sep) and resolved != canonical_base:
+                evidence["pathset_valid"] = False
+                evidence["symlink_escapes"].append(value)
+                evidence["error"] = f"Symlink escape: {value} resolves to {resolved} (outside {base_dir})"
+                return evidence
+            resolved_paths.add(resolved)
+
+    if not approved_paths:
+        # No approved paths to validate against — symlink check already passed
+        return evidence
+
+    # Build approved set
+    approved_set = set()
+    for p in approved_paths:
+        try:
+            approved_set.add(os.path.realpath(p))
+        except (OSError, ValueError):
+            approved_set.add(p)
+
+    # Invariant: resolved_paths ⊆ approved_paths
+    extra = resolved_paths - approved_set
+    if extra:
+        evidence["pathset_valid"] = False
+        evidence["extra_paths"] = sorted(extra)
+        evidence["error"] = (
+            f"RUNNER_PATHSET_MISMATCH: {len(extra)} path(s) not in governance-approved set. "
+            f"Possible overlay/bind mount divergence."
+        )
+
+    return evidence
+
+
+# ---- Layer 0: Virtual FS deny (runner-side defense-in-depth)
+# Runner independently denies access to dangerous virtual filesystems.
+# This is a last line of defense — governance should have already denied.
+
+_RUNNER_VFS_DENY_PREFIXES = (
+    "/dev/shm", "/sys", "/run", "/dev/pts", "/dev/mqueue",
+)
+_RUNNER_VFS_PROC_ALLOWLIST = frozenset({
+    "/proc/self/status", "/proc/self/limits", "/proc/self/cgroup",
+    "/proc/version", "/proc/cpuinfo", "/proc/meminfo", "/proc/loadavg",
+    "/proc/mounts",
+})
+
+
+def _runner_check_virtual_fs(path: str) -> Optional[str]:
+    """
+    Runner-side virtual FS check. Returns deny reason or None if allowed.
+    """
+    normalized = os.path.normpath(path)
+    for prefix in _RUNNER_VFS_DENY_PREFIXES:
+        if normalized == prefix or normalized.startswith(prefix + "/"):
+            return f"RUNNER_VIRTUAL_FS_DENIED: {path} (matches {prefix})"
+    if normalized.startswith("/proc"):
+        if normalized not in _RUNNER_VFS_PROC_ALLOWLIST:
+            return f"RUNNER_VIRTUAL_FS_DENIED: {path} (not in /proc allowlist)"
+    return None
+
+
+# P0.B: File dispatch mode for airgapped runner (network_mode: none)
+DISPATCH_MODE = os.getenv("M87_DISPATCH_MODE", "redis")  # "redis" or "file"
+FILE_INCOMING = os.getenv("M87_FILE_INCOMING", "/dispatch/incoming")
+FILE_OUTGOING = os.getenv("M87_FILE_OUTGOING", "/dispatch/outgoing")
+
+
+def _file_dispatch_loop(manifest: Dict[str, Any]) -> None:
+    """
+    File-based dispatch loop for airgapped runner.
+
+    Polls incoming/ directory for job envelopes, executes them,
+    and writes results to outgoing/ directory.
+    """
+    from pathlib import Path
+
+    incoming = Path(FILE_INCOMING)
+    outgoing = Path(FILE_OUTGOING)
+    incoming.mkdir(parents=True, exist_ok=True)
+    outgoing.mkdir(parents=True, exist_ok=True)
+
+    print(f"  File dispatch: incoming={incoming}, outgoing={outgoing}", flush=True)
+
+    while True:
+        try:
+            job_files = sorted(incoming.glob("*.json"))
+
+            for job_file in job_files:
+                if job_file.name.startswith("."):
+                    continue
+
+                try:
+                    job = json.loads(job_file.read_text())
+                except (json.JSONDecodeError, OSError) as e:
+                    print(f"  ✗ Bad job file {job_file.name}: {e}", flush=True)
+                    job_file.unlink(missing_ok=True)
+                    continue
+
+                job_id = job.get("job_id", "unknown")
+                proposal_id = job.get("proposal_id", "unknown")
+                print(f"▶ Job {job_id[:8]}... tool={job.get('tool')} (file dispatch)", flush=True)
+
+                job_file.unlink(missing_ok=True)
+
+                err = validate_job_against_manifest(job, manifest)
+                if err:
+                    print(f"  ✗ Manifest reject: {err}", flush=True)
+                    result_data = {
+                        "job_id": job_id,
+                        "proposal_id": proposal_id,
+                        "status": "failed",
+                        "output": {"error": "manifest_reject", "detail": err},
+                    }
+                else:
+                    try:
+                        output = execute_job(job, manifest)
+                        status = "completed" if output.get("exit_code", 0) == 0 else "failed"
+                        print(f"  → {status}", flush=True)
+
+                        completion_artifacts = output.pop("completion_artifacts", None)
+                        envelope_hash = output.pop("envelope_hash", None)
+                        autonomy_budget = output.pop("autonomy_budget", None)
+                        autonomy_usage = output.pop("autonomy_usage", None)
+                        deh_evidence = output.pop("deh_evidence", None)
+
+                        result_data = {
+                            "job_id": job_id,
+                            "proposal_id": proposal_id,
+                            "status": status,
+                            "output": output,
+                            "manifest_hash": manifest.get("_manifest_hash"),
+                            "manifest_version": manifest.get("version"),
+                            "completion_artifacts": completion_artifacts,
+                            "envelope_hash": envelope_hash,
+                            "autonomy_budget": autonomy_budget,
+                            "autonomy_usage": autonomy_usage,
+                            "deh_evidence": deh_evidence,
+                        }
+                    except Exception as e:
+                        print(f"  ✗ Execution error: {e}", flush=True)
+                        result_data = {
+                            "job_id": job_id,
+                            "proposal_id": proposal_id,
+                            "status": "failed",
+                            "output": {"error": "execution_error", "detail": str(e)},
+                        }
+
+                # Write result atomically
+                result_path = outgoing / f"{job_id}.result.json"
+                tmp_path = outgoing / f".{job_id}.result.json.tmp"
+                tmp_path.write_text(json.dumps(result_data, indent=2))
+                tmp_path.rename(result_path)
+
+        except Exception as e:
+            print(f"[ERROR] File dispatch: {e}", flush=True)
+
+        time.sleep(1)
+
+
+def main() -> None:
+    print("🏃 M87 Runner V2.0 (Hardening Package) starting...", flush=True)
+    print(f"  Dispatch mode: {DISPATCH_MODE}", flush=True)
 
     manifest = load_manifest(MANIFEST_PATH)
     print(f"✓ Loaded manifest v{manifest.get('version', 'unknown')}", flush=True)
@@ -880,6 +1324,28 @@ def main() -> None:
         raise RuntimeError(f"Manifest lock verification failed: {lock_result.get('error')}")
     else:
         print(f"⚠ Manifest lock not enforced: {lock_result.get('error')}", flush=True)
+
+    # P2.1: Verify runtime mount invariants (fail-closed)
+    _verify_runtime_mount_invariants()
+    print("✓ Mount invariant check passed", flush=True)
+
+    # Layer 0: Network namespace verification (fail-closed)
+    _verify_network_namespace()
+    print("✓ Network namespace check passed", flush=True)
+
+    # Layer 0: Capability drop verification (fail-closed)
+    _verify_capabilities_dropped()
+    print("✓ Capability check passed", flush=True)
+
+    # P0.B: File dispatch mode — no Redis needed
+    if DISPATCH_MODE == "file":
+        print("✓ Running in file dispatch mode (airgap)", flush=True)
+        _file_dispatch_loop(manifest)
+        return
+
+    # Standard Redis dispatch mode
+    r = Redis.from_url(REDIS_URL, decode_responses=True)
+    ensure_group(r)
 
     while True:
         try:

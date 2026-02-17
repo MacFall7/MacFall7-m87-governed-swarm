@@ -79,9 +79,19 @@ class TestGovernanceInvariants:
     @pytest.fixture
     def client(self, mock_redis, mock_key_store):
         """Create test client with mocked dependencies."""
+        # P2.A: Mock rate limiter to always allow
+        mock_rate_limiter = MagicMock()
+        mock_rl_result = MagicMock()
+        mock_rl_result.allowed = True
+        mock_rl_result.current = 1
+        mock_rl_result.limit = 30
+        mock_rl_result.remaining = 29
+        mock_rate_limiter.check_rate_limit.return_value = mock_rl_result
+
         with patch("app.main.rdb", mock_redis), \
              patch("app.main.key_store", mock_key_store), \
              patch("app.main.key_verifier") as mock_verifier, \
+             patch("app.main.rate_limiter", mock_rate_limiter), \
              patch("app.main._db_available", True), \
              patch("app.main.persist_proposal") as mock_persist_proposal, \
              patch("app.main.persist_decision") as mock_persist_decision, \

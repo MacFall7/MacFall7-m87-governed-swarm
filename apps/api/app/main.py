@@ -44,6 +44,41 @@ from .governance.reversibility import (
     is_read_only_action,
 )
 
+# V2 Hardening: P0–P2 modules
+from .governance.input_validation import (
+    check_empty_args,
+    check_semantic_truncation,
+    validate_tool_inputs,
+)
+from .governance.virtual_fs_deny import (
+    check_virtual_fs_access,
+    VIRTUAL_FS_DENIED,
+    VIRTUAL_FS_NOT_IN_ALLOWLIST,
+)
+from .governance.glob_validation import (
+    governance_expand_glob,
+    runner_revalidate_glob,
+)
+from .governance.enumeration_limits import (
+    bounded_recursive_enumerate,
+    EnumerationLimits,
+)
+from .governance.quarantine import (
+    quarantine_manager,
+    observability_quarantine,
+    DegradationTier,
+)
+from .governance.rate_limiter import KeyRateLimiter, RateLimitResult
+from .governance.effects import EFFECT_SCHEMA_VERSION
+from .governance.call_receipt import (
+    ReceiptEmitter, ProposalRecord, DecisionRecord, ExecutionRecord,
+    EffectClass, DecisionOutcome, PostureLevel, ReversibilityClass,
+    classify_effects, map_decision_outcome, map_posture_level,
+)
+
+import logging as _logging
+_receipt_logger = _logging.getLogger("m87.receipts")
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,9 +88,21 @@ app = FastAPI(title="m87-governed-swarm-api", version="0.3.0")
 # ---- Config
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-BOOTSTRAP_KEY = os.getenv("M87_API_KEY", "m87-dev-key-change-me")
+# Auth keys: bootstrap (admin) + per-service scoped keys
+# M87_BOOTSTRAP_KEY is the admin-only key. Services MUST NOT use it.
+# Falls back to M87_API_KEY for backward compatibility.
+BOOTSTRAP_KEY = os.getenv("M87_BOOTSTRAP_KEY", os.getenv("M87_API_KEY", "m87-dev-key-change-me"))
+
+# Per-service keys (each service gets its own scoped key)
+SERVICE_KEY_RUNNER = os.getenv("M87_RUNNER_KEY", "")
+SERVICE_KEY_CASEY = os.getenv("M87_CASEY_KEY", "")
+SERVICE_KEY_JORDAN = os.getenv("M87_JORDAN_KEY", "")
+SERVICE_KEY_RILEY = os.getenv("M87_RILEY_KEY", "")
+SERVICE_KEY_NOTIFIER = os.getenv("M87_NOTIFIER_KEY", "")
+
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
 ENABLE_TEST_ENDPOINTS = os.getenv("M87_ENABLE_TEST_ENDPOINTS", "false").lower() == "true"
+M87_ENV = os.getenv("M87_ENV", "dev")  # dev | staging | prod
 
 
 def load_tool_manifest() -> Dict[str, Any]:
@@ -205,12 +252,16 @@ rdb = Redis.from_url(REDIS_URL, decode_responses=True)
 key_store = KeyStore(rdb)
 key_verifier = KeyVerifier(key_store)
 
+# ---- P2.A: Per-key rate limiter (Redis sliding window)
+rate_limiter = KeyRateLimiter(rdb)
+
 # Stream keys
 EVENT_STREAM = "m87:events"
 JOB_STREAM = "m87:jobs"
 
-# Runner tool allowlist
-ALLOWED_TOOLS = {"echo", "pytest", "git", "build"}
+# Runner tool allowlist — MUST match tool_manifest.json exactly.
+# Adding a tool here without a manifest entry is a Layer 1 violation.
+ALLOWED_TOOLS = {"echo", "pytest"}
 
 
 # ---- V1.3: Agent Profiles (effect scopes + risk thresholds)
@@ -252,6 +303,68 @@ def emit(event_type: str, payload: Dict[str, Any]) -> str:
     """Emit event to Redis stream, returns event ID."""
     event_id = rdb.xadd(EVENT_STREAM, {"type": event_type, "payload": json.dumps(payload)})
     return event_id
+
+
+# ---- P1.B: Kill-switch lockdown
+# In prod, M87_DISABLE_PHASE36_GOVERNANCE=1 is a dangerous emergency-only escape hatch.
+# If enabled in prod, the API refuses to start unless the bootstrap key is explicitly set
+# (not the default) — proving a human operator authorized the override.
+KILLSWITCH_OVERRIDE_PATH = os.getenv("M87_KILLSWITCH_OVERRIDE_PATH", "")
+
+
+def _enforce_killswitch_lockdown() -> None:
+    """
+    P1.B — Refuse to boot in prod if kill-switch is enabled without authorization.
+
+    Rules:
+    - dev/staging: kill-switch allowed (with warning)
+    - prod + kill-switch OFF: no action needed
+    - prod + kill-switch ON: refuse boot UNLESS:
+        1. M87_BOOTSTRAP_KEY is set to a non-default value (proves human set it), AND
+        2. M87_KILLSWITCH_OVERRIDE_PATH points to an existing file (signed override)
+    """
+    killswitch_on = os.environ.get("M87_DISABLE_PHASE36_GOVERNANCE", "0") == "1"
+
+    if not killswitch_on:
+        return  # Nothing to do
+
+    if M87_ENV != "prod":
+        logger.warning(
+            "KILLSWITCH ACTIVE: M87_DISABLE_PHASE36_GOVERNANCE=1 in %s mode. "
+            "Phase 3-6 governance is BYPASSED.", M87_ENV
+        )
+        return
+
+    # Prod + kill-switch ON: require authorization
+    default_keys = {"m87-dev-key-change-me", "change-this-to-a-long-random-secret", ""}
+    if BOOTSTRAP_KEY in default_keys:
+        raise RuntimeError(
+            "KILLSWITCH_LOCKDOWN: Cannot disable Phase 3-6 governance in prod "
+            "with a default bootstrap key. Set M87_BOOTSTRAP_KEY to a unique secret."
+        )
+
+    if KILLSWITCH_OVERRIDE_PATH:
+        override_path = Path(KILLSWITCH_OVERRIDE_PATH)
+        if override_path.exists():
+            logger.warning(
+                "KILLSWITCH AUTHORIZED: Override file present at %s. "
+                "Phase 3-6 governance is BYPASSED in prod. THIS IS AN EMERGENCY MEASURE.",
+                KILLSWITCH_OVERRIDE_PATH,
+            )
+            return
+        else:
+            raise RuntimeError(
+                f"KILLSWITCH_LOCKDOWN: Override file not found at {KILLSWITCH_OVERRIDE_PATH}. "
+                "Cannot disable Phase 3-6 governance in prod without signed override."
+            )
+
+    # Prod requires BOTH non-default key AND override file. Key-only is not sufficient
+    # to disable governance — the override file proves deliberate operator action on the host.
+    raise RuntimeError(
+        "KILLSWITCH_LOCKDOWN: Cannot disable Phase 3-6 governance in prod without "
+        "M87_KILLSWITCH_OVERRIDE_PATH pointing to an existing override file. "
+        "Set the env var and place the signed override file on the host."
+    )
 
 
 # ---- Startup: Initialize database and seed bootstrap key
@@ -326,7 +439,88 @@ async def startup_event():
     else:
         logger.info(f"Bootstrap key already exists: {existing.key_id}")
 
-    logger.info(f"M87 API ready (db_available={_db_available})")
+    # P0.A: Seed scoped service keys (idempotent)
+    # Each service gets only the scopes it needs — no shared admin key.
+    _SERVICE_KEY_PROFILES = [
+        {
+            "env_key": SERVICE_KEY_RUNNER,
+            "key_id": "key_runner",
+            "principal_type": "runner",
+            "principal_id": "runner",
+            "endpoint_scopes": {"runner:result"},
+            "effect_scopes": set(),
+            "max_risk": 0.0,
+            "description": "Runner: can only report job results",
+        },
+        {
+            "env_key": SERVICE_KEY_CASEY,
+            "key_id": "key_casey",
+            "principal_type": "adapter",
+            "principal_id": "Casey",
+            "endpoint_scopes": {"proposal:create"},
+            "effect_scopes": {"READ_REPO", "WRITE_PATCH", "RUN_TESTS"},
+            "max_risk": 0.6,
+            "description": "Casey adapter: code changes and testing",
+        },
+        {
+            "env_key": SERVICE_KEY_JORDAN,
+            "key_id": "key_jordan",
+            "principal_type": "adapter",
+            "principal_id": "Jordan",
+            "endpoint_scopes": {"proposal:create"},
+            "effect_scopes": {"SEND_NOTIFICATION", "BUILD_ARTIFACT", "CREATE_PR", "READ_REPO"},
+            "max_risk": 0.5,
+            "description": "Jordan adapter: artifacts, notifications, PRs",
+        },
+        {
+            "env_key": SERVICE_KEY_RILEY,
+            "key_id": "key_riley",
+            "principal_type": "adapter",
+            "principal_id": "Riley",
+            "endpoint_scopes": {"proposal:create"},
+            "effect_scopes": {"READ_REPO", "BUILD_ARTIFACT", "SEND_NOTIFICATION"},
+            "max_risk": 0.4,
+            "description": "Riley adapter: analysis and reporting",
+        },
+        {
+            "env_key": SERVICE_KEY_NOTIFIER,
+            "key_id": "key_notifier",
+            "principal_type": "service",
+            "principal_id": "notifier",
+            "endpoint_scopes": {"admin:emit"},
+            "effect_scopes": set(),
+            "max_risk": 0.0,
+            "description": "Notifier: can only emit events",
+        },
+    ]
+
+    seeded_count = 0
+    for profile in _SERVICE_KEY_PROFILES:
+        plaintext = profile["env_key"]
+        if not plaintext:
+            continue  # Not configured — skip (backward compat)
+        record = key_store.seed_service_key(
+            plaintext_key=plaintext,
+            key_id=profile["key_id"],
+            principal_type=profile["principal_type"],
+            principal_id=profile["principal_id"],
+            endpoint_scopes=profile["endpoint_scopes"],
+            effect_scopes=profile["effect_scopes"],
+            max_risk=profile["max_risk"],
+            description=profile["description"],
+        )
+        seeded_count += 1
+        logger.info(f"Service key seeded: {record.key_id} ({record.principal_id})")
+
+    if seeded_count > 0:
+        logger.info(f"Seeded {seeded_count} scoped service key(s)")
+    else:
+        logger.warning("No scoped service keys configured — services may be using bootstrap key")
+
+    # P1.B: Kill-switch lockdown
+    _enforce_killswitch_lockdown()
+
+    logger.info(f"M87 API ready (db_available={_db_available}, env={M87_ENV}, killswitch_locked={'prod' if M87_ENV == 'prod' else 'off'})")
 
 
 # ---- Hard fail-safe helper (Phase 2)
@@ -384,19 +578,22 @@ def verify_auth(
 # ---- Minimal in-service models
 EffectTag = Literal[
     "READ_REPO",
+    "READ_SECRETS",
+    "READ_CONFIG",
+    "COMPUTE",
     "WRITE_PATCH",
     "RUN_TESTS",
     "BUILD_ARTIFACT",
-    "NETWORK_CALL",
-    "SEND_NOTIFICATION",
     "CREATE_PR",
     "MERGE",
     "DEPLOY",
-    "READ_SECRETS",
+    "NETWORK_CALL",
+    "SEND_NOTIFICATION",
+    "OTHER",
 ]
 
 Decision = Literal["ALLOW", "DENY", "REQUIRE_HUMAN", "NEED_MORE_EVIDENCE"]
-RunnerTool = Literal["echo", "pytest", "git", "build"]
+RunnerTool = Literal["echo", "pytest"]
 
 
 class Intent(BaseModel):
@@ -728,6 +925,8 @@ def enqueue_job(
         "cleanup_cost": cleanup_cost,
         "budget_multiplier": budget_multiplier,
         "retry_limit": retry_limit,
+        # Layer 1: Effect schema versioning (runner rejects mismatches)
+        "effect_schema_version": EFFECT_SCHEMA_VERSION,
     }
 
     # Phase 2: Persist job to Postgres (write-through)
@@ -783,6 +982,97 @@ def check_agent_risk(agent: str, risk_score: Optional[float]) -> tuple[bool, flo
     if risk_score is None:
         return True, max_risk
     return risk_score <= max_risk, max_risk
+
+
+# ---- Per-Call Receipt helpers (additive, fail-safe)
+
+def _build_proposal_record(proposal: Proposal) -> ProposalRecord:
+    """Build a ProposalRecord from an M87 Proposal. Fail-safe: raises on error."""
+    proposal_json = proposal.model_dump_json()
+    proposal_hash = hashlib.sha256(proposal_json.encode()).hexdigest()
+    args_json = json.dumps(proposal.artifacts or [], sort_keys=True)
+    args_hash = hashlib.sha256(args_json.encode()).hexdigest()
+
+    resource_paths = []
+    if proposal.artifacts:
+        for art in proposal.artifacts:
+            for key in ("path", "source", "destination", "target"):
+                if art.get(key):
+                    resource_paths.append(art[key])
+
+    rev_class = None
+    if proposal.reversibility_class:
+        try:
+            rev_class = ReversibilityClass(proposal.reversibility_class)
+        except ValueError:
+            pass
+
+    return ProposalRecord(
+        proposal_hash=proposal_hash,
+        tool="echo",  # default tool for governance proposals
+        operation=proposal.summary[:128] if proposal.summary else None,
+        args_hash=args_hash,
+        args_redacted=False,
+        resource_paths=resource_paths,
+        effect_class=classify_effects(list(proposal.effects)),
+        reversibility_class=rev_class,
+    )
+
+
+def _build_decision_record(
+    decision_str: str,
+    reasons: list,
+    risk_score: Optional[float] = None,
+) -> DecisionRecord:
+    """Build a DecisionRecord from governance decision. Fail-safe: raises on error."""
+    tier_value = quarantine_manager.get_state().current_tier.value
+    return DecisionRecord(
+        outcome=map_decision_outcome(decision_str),
+        posture_at_decision=map_posture_level(tier_value),
+        risk_delta=risk_score,
+        cumulative_risk=risk_score,
+        reason="; ".join(reasons) if reasons else None,
+        policy_path="governance_gate",
+    )
+
+
+def _emit_receipt_for_decision(
+    proposal: Proposal,
+    decision_str: str,
+    reasons: list,
+) -> Optional[object]:
+    """
+    Emit a per-call receipt for a governance decision.
+
+    Returns the CallReceipt or None on failure.
+    MUST NOT block the governance pipeline.
+    """
+    try:
+        emitter = ReceiptEmitter(session_id=proposal.proposal_id)
+        proposal_record = _build_proposal_record(proposal)
+        decision_record = _build_decision_record(
+            decision_str, reasons, proposal.risk_score,
+        )
+        receipt = emitter.emit_decision(proposal_record, decision_record)
+
+        if decision_str != "ALLOW":
+            emitter.finalize_denied(receipt)
+        else:
+            receipt.finalize()
+
+        # Emit receipt to telemetry stream
+        emit("call_receipt.emitted", {
+            "proposal_id": proposal.proposal_id,
+            "sequence_number": receipt.sequence_number,
+            "decision": decision_str,
+            "receipt_hash": receipt.receipt_hash,
+            "effect_class": proposal_record.effect_class.value,
+        })
+
+        return receipt
+    except Exception as e:
+        _receipt_logger.warning(f"Receipt emission failed: {e}")
+        return None
 
 
 # ---- V1 Governance: Shadow Eval endpoints
@@ -901,11 +1191,34 @@ def health():
 
     return {
         "ok": system_ok,
-        "version": "0.3.0",
+        "version": "2.0.0",
         "redis": "connected" if redis_ok else "disconnected",
         "postgres": "connected" if db_health["connected"] else "disconnected",
         "persistence_available": _db_available,
+        "quarantine_tier": quarantine_manager.get_state().current_tier.value,
     }
+
+
+# ---- v2 Quarantine + Degradation Tier endpoints ----
+
+@app.get("/v1/quarantine/status")
+def quarantine_status(x_m87_key: Optional[str] = Header(None, alias="X-M87-Key")):
+    """Get current quarantine posture and degradation tier."""
+    verify_auth(x_m87_key, "admin:keys")
+    state = quarantine_manager.get_state()
+    return state.to_dict()
+
+
+@app.get("/v1/quarantine/observability")
+def quarantine_observability(
+    agent_id: Optional[str] = None,
+    limit: int = 100,
+    x_m87_key: Optional[str] = Header(None, alias="X-M87-Key"),
+):
+    """Get quarantined agent-supplied metadata (untrusted)."""
+    verify_auth(x_m87_key, "admin:keys")
+    entries = observability_quarantine.get_entries(agent_id=agent_id, limit=limit)
+    return {"entries": entries, "total": len(entries)}
 
 
 @app.get("/v1/agents")
@@ -997,6 +1310,25 @@ def govern_proposal(
         risk_score=proposal.risk_score,
     )
 
+    # P2.A: Per-key rate limiting (after auth, before expensive governance)
+    rl = rate_limiter.check_rate_limit(auth.principal_id)
+    if not rl.allowed:
+        emit("rate_limit.exceeded", {
+            "principal_id": auth.principal_id,
+            "current": rl.current,
+            "limit": rl.limit,
+        })
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "RATE_LIMIT_EXCEEDED",
+                "message": rl.reason,
+                "retry_after": rl.retry_after,
+                "current": rl.current,
+                "limit": rl.limit,
+            },
+        )
+
     # Phase 2: Persist proposal to Postgres (write-through)
     try:
         persist_proposal(
@@ -1021,6 +1353,32 @@ def govern_proposal(
     reasons: List[str] = []
     agent = proposal.agent
 
+    # v2 Quarantine Posture: Check if current tier allows this proposal
+    if not quarantine_manager.is_proposal_allowed(list(proposal.effects)):
+        tier_state = quarantine_manager.get_state()
+        reasons.append(
+            f"Degradation Tier {tier_state.current_tier.value} "
+            f"({tier_state.current_tier.name}): proposal effects not permitted."
+        )
+        decision = GovernanceDecision(
+            proposal_id=proposal.proposal_id,
+            decision="DENY",
+            reasons=reasons,
+        )
+        persist_decision(
+            proposal_id=proposal.proposal_id,
+            outcome="DENY",
+            reasons=reasons,
+            decided_by="policy:quarantine_posture",
+        )
+        emit("proposal.denied", {
+            **decision.model_dump(),
+            "agent": agent,
+            "principal_id": auth.principal_id,
+            "quarantine_tier": tier_state.current_tier.value,
+        })
+        return decision
+
     # Rule 1: READ_SECRETS is absolutely forbidden
     if "READ_SECRETS" in proposal.effects:
         reasons.append("READ_SECRETS is forbidden.")
@@ -1042,6 +1400,39 @@ def govern_proposal(
             "principal_id": auth.principal_id,
         })
         return decision
+
+    # Layer 0: Virtual FS deny — scan all artifact paths against explicit deny rules
+    # Fail-closed: if ANY path matches a DENY rule, the entire proposal is denied.
+    if proposal.artifacts:
+        for artifact in proposal.artifacts:
+            for key in ("path", "source", "destination", "target"):
+                artifact_path = artifact.get(key)
+                if artifact_path:
+                    fs_result = check_virtual_fs_access(artifact_path)
+                    if not fs_result.allowed:
+                        reasons.append(
+                            f"Virtual FS denied: {artifact_path} "
+                            f"({fs_result.deny_code}: {fs_result.deny_reason})"
+                        )
+                        decision = GovernanceDecision(
+                            proposal_id=proposal.proposal_id,
+                            decision="DENY",
+                            reasons=reasons,
+                        )
+                        persist_decision(
+                            proposal_id=proposal.proposal_id,
+                            outcome="DENY",
+                            reasons=reasons,
+                            decided_by="policy:virtual_fs_deny",
+                        )
+                        emit("proposal.denied", {
+                            **decision.model_dump(),
+                            "agent": agent,
+                            "principal_id": auth.principal_id,
+                            "deny_code": fs_result.deny_code,
+                            "denied_path": artifact_path,
+                        })
+                        return decision
 
     # Rule 2: Check agent effect scope
     effects_allowed, disallowed_effects = check_agent_effects(agent, proposal.effects)
@@ -1321,6 +1712,9 @@ def govern_proposal(
         "agent": agent,
         "principal_id": auth.principal_id,
     })
+
+    # Per-Call Receipt: ALLOW path (observation-only, fail-safe)
+    _emit_receipt_for_decision(proposal, "ALLOW", reasons)
 
     job_id = enqueue_job(
         proposal_id=proposal.proposal_id,

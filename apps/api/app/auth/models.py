@@ -2,14 +2,29 @@
 M87 API Key Authentication Models
 
 Scoped keys with principal, effect, and risk constraints.
-Keys are hashed (bcrypt) for storage security.
+Keys are hashed with Argon2id (passlib) for storage security.
+Legacy SHA-256 hashes are accepted and transparently rehashed on verify.
 """
 
 from pydantic import BaseModel, Field
 from typing import Optional, Set, Literal
 from datetime import datetime
 import hashlib
+import hmac
 import secrets
+import logging
+
+_logger = logging.getLogger(__name__)
+
+# Argon2id via passlib (preferred)
+try:
+    from passlib.hash import argon2 as _argon2_base
+    _ARGON2_HASHER = _argon2_base.using(type="ID", memory_cost=65536, time_cost=3, parallelism=1)
+    _ARGON2_AVAILABLE = True
+except ImportError:
+    _ARGON2_HASHER = None
+    _ARGON2_AVAILABLE = False
+    _logger.warning("passlib[argon2] not installed — falling back to SHA-256 only")
 
 
 # Principal types
@@ -115,14 +130,59 @@ def generate_key() -> tuple[str, str]:
     return plaintext, key_hash
 
 
+def _sha256_hash(plaintext: str) -> str:
+    """Legacy SHA-256 hash (deterministic, used for lookup + migration)."""
+    return hashlib.sha256(plaintext.encode()).hexdigest()
+
+
+def _is_legacy_sha256(h: str) -> bool:
+    """Check if a stored hash is legacy SHA-256 (64-char hex)."""
+    return len(h) == 64 and all(c in "0123456789abcdef" for c in h)
+
+
 def hash_key(plaintext: str) -> str:
     """
-    Hash an API key using SHA-256.
+    Hash an API key using Argon2id (preferred) or SHA-256 (fallback).
 
-    For production, consider using bcrypt or argon2 for timing-attack resistance.
-    SHA-256 is used here for simplicity and speed in high-volume scenarios.
+    Argon2id provides:
+    - Timing-attack resistance (constant-time comparison)
+    - Memory-hard hashing (GPU/ASIC resistant)
+    - Salt per hash (no rainbow tables)
+
+    Falls back to SHA-256 if passlib[argon2] is not installed.
     """
-    return hashlib.sha256(plaintext.encode()).hexdigest()
+    if _ARGON2_AVAILABLE:
+        return _ARGON2_HASHER.hash(plaintext)
+    return _sha256_hash(plaintext)
+
+
+def verify_key_hash(plaintext: str, stored_hash: str) -> bool:
+    """
+    Verify a plaintext key against a stored hash.
+
+    Supports both Argon2id and legacy SHA-256 hashes.
+    Returns True if the key matches.
+    """
+    if _is_legacy_sha256(stored_hash):
+        return hmac.compare_digest(stored_hash, _sha256_hash(plaintext))
+    if _ARGON2_AVAILABLE:
+        try:
+            return _ARGON2_HASHER.verify(plaintext, stored_hash)
+        except Exception:
+            return False
+    return False
+
+
+def needs_rehash(stored_hash: str) -> bool:
+    """Check if a stored hash should be rehashed to Argon2id."""
+    if not _ARGON2_AVAILABLE:
+        return False
+    if _is_legacy_sha256(stored_hash):
+        return True
+    try:
+        return _ARGON2_HASHER.needs_update(stored_hash)
+    except Exception:
+        return False
 
 
 def generate_key_id() -> str:
