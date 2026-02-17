@@ -257,6 +257,7 @@ class OfflineVerifier:
     # Files excluded from content hash to break circular dependencies.
     # bundle_signature.sig: signature references the content hash
     # bundle_receipt.json: receipt stores bundle_sha256 = content hash
+    # KEEP IN SYNC: tests/test_offline_verify.py BundleBuilder.build()
     _HASH_EXCLUDED_FILES = frozenset({"bundle_signature.sig", "bundle_receipt.json"})
 
     def _compute_content_hash(self, contents: Dict[str, bytes]) -> str:

@@ -247,7 +247,7 @@ class BundleBuilder:
 
         # Compute content hash (excludes bundle_receipt.json and bundle_signature.sig
         # to break the circular dependency — both reference the content hash).
-        # This matches OfflineVerifier._compute_content_hash().
+        # KEEP IN SYNC: governance/verify/offline.py OfflineVerifier._HASH_EXCLUDED_FILES
         h = hashlib.sha256()
         for key in sorted(self._files.keys()):
             h.update(key.encode("utf-8"))
