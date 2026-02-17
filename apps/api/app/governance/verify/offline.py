@@ -46,6 +46,7 @@ class VerificationReport(BaseModel):
         "Nonce monotonicity (requires state store)",
         "Snapshot freshness (requires live repo access)",
         "Governance service approval status (requires network)",
+        "Content hash excludes bundle_receipt.json (circular dependency; receipt integrity depends on SIG_VALID)",
     ])
     duration_ms: Optional[float] = None
 
@@ -265,6 +266,12 @@ class OfflineVerifier:
         Excludes bundle_signature.sig and bundle_receipt.json to break the
         circular dependency: both reference the content hash, so they cannot
         be included in its computation.
+
+        Trust chain: SIG_VALID verifies the signature covers the full tar
+        (including receipt). BUNDLE_HASH_MATCH verifies the content hash
+        stored in the receipt matches the artifacts. Together they form a
+        complete integrity chain, but receipt integrity depends on SIG_VALID
+        passing — BUNDLE_HASH_MATCH alone does not cover the receipt.
         """
         h = hashlib.sha256()
         for key in sorted(contents.keys()):
