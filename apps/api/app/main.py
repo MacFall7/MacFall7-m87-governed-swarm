@@ -321,8 +321,7 @@ def _enforce_killswitch_lockdown() -> None:
     - prod + kill-switch OFF: no action needed
     - prod + kill-switch ON: refuse boot UNLESS:
         1. M87_BOOTSTRAP_KEY is set to a non-default value (proves human set it), AND
-        2. Either M87_KILLSWITCH_OVERRIDE_PATH points to an existing file (signed override)
-           OR M87_ENV is not "prod"
+        2. M87_KILLSWITCH_OVERRIDE_PATH points to an existing file (signed override)
     """
     killswitch_on = os.environ.get("M87_DISABLE_PHASE36_GOVERNANCE", "0") == "1"
 
@@ -359,10 +358,12 @@ def _enforce_killswitch_lockdown() -> None:
                 "Cannot disable Phase 3-6 governance in prod without signed override."
             )
 
-    # Bootstrap key is non-default but no override file configured
-    logger.warning(
-        "KILLSWITCH AUTHORIZED (key-only): Phase 3-6 governance BYPASSED in prod. "
-        "Configure M87_KILLSWITCH_OVERRIDE_PATH for stronger authorization."
+    # Prod requires BOTH non-default key AND override file. Key-only is not sufficient
+    # to disable governance — the override file proves deliberate operator action on the host.
+    raise RuntimeError(
+        "KILLSWITCH_LOCKDOWN: Cannot disable Phase 3-6 governance in prod without "
+        "M87_KILLSWITCH_OVERRIDE_PATH pointing to an existing override file. "
+        "Set the env var and place the signed override file on the host."
     )
 
 

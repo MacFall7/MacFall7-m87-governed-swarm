@@ -35,6 +35,17 @@ class KeyStore:
     def __init__(self, redis: Redis):
         self.redis = redis
 
+    @staticmethod
+    def _deserialize_record(data: dict) -> KeyRecord:
+        """Deserialize a Redis-stored dict into a KeyRecord."""
+        data["endpoint_scopes"] = set(data["endpoint_scopes"])
+        data["effect_scopes"] = set(data["effect_scopes"])
+        if data.get("expires_at"):
+            data["expires_at"] = datetime.fromisoformat(data["expires_at"])
+        if data.get("created_at"):
+            data["created_at"] = datetime.fromisoformat(data["created_at"])
+        return KeyRecord(**data)
+
     def _key_path(self, key_hash: str) -> str:
         return f"{self.KEY_PREFIX}{key_hash}"
 
@@ -137,13 +148,7 @@ class KeyStore:
                 record_data = json.loads(data)
                 stored_hash = record_data.get("key_hash", "")
                 if verify_key_hash(plaintext, stored_hash):
-                    record_data["endpoint_scopes"] = set(record_data["endpoint_scopes"])
-                    record_data["effect_scopes"] = set(record_data["effect_scopes"])
-                    if record_data.get("expires_at"):
-                        record_data["expires_at"] = datetime.fromisoformat(record_data["expires_at"])
-                    if record_data.get("created_at"):
-                        record_data["created_at"] = datetime.fromisoformat(record_data["created_at"])
-                    return KeyRecord(**record_data)
+                    return self._deserialize_record(record_data)
             if cursor == 0:
                 break
 
@@ -154,18 +159,7 @@ class KeyStore:
         data = self.redis.get(self._key_path(key_hash))
         if not data:
             return None
-
-        record_data = json.loads(data)
-        # Convert lists back to sets
-        record_data["endpoint_scopes"] = set(record_data["endpoint_scopes"])
-        record_data["effect_scopes"] = set(record_data["effect_scopes"])
-        # Parse datetime
-        if record_data.get("expires_at"):
-            record_data["expires_at"] = datetime.fromisoformat(record_data["expires_at"])
-        if record_data.get("created_at"):
-            record_data["created_at"] = datetime.fromisoformat(record_data["created_at"])
-
-        return KeyRecord(**record_data)
+        return self._deserialize_record(json.loads(data))
 
     def get_by_id(self, key_id: str) -> Optional[KeyRecord]:
         """Look up key by key_id."""
@@ -217,14 +211,7 @@ class KeyStore:
                     continue
                 data = self.redis.get(key_path)
                 if data:
-                    record_data = json.loads(data)
-                    record_data["endpoint_scopes"] = set(record_data["endpoint_scopes"])
-                    record_data["effect_scopes"] = set(record_data["effect_scopes"])
-                    if record_data.get("expires_at"):
-                        record_data["expires_at"] = datetime.fromisoformat(record_data["expires_at"])
-                    if record_data.get("created_at"):
-                        record_data["created_at"] = datetime.fromisoformat(record_data["created_at"])
-                    keys.append(KeyRecord(**record_data))
+                    keys.append(self._deserialize_record(json.loads(data)))
             if cursor == 0:
                 break
         return keys

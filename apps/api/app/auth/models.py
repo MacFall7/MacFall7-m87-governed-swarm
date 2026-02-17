@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, Set, Literal
 from datetime import datetime
 import hashlib
+import hmac
 import secrets
 import logging
 
@@ -163,7 +164,7 @@ def verify_key_hash(plaintext: str, stored_hash: str) -> bool:
     Returns True if the key matches.
     """
     if _is_legacy_sha256(stored_hash):
-        return _sha256_hash(plaintext) == stored_hash
+        return hmac.compare_digest(stored_hash, _sha256_hash(plaintext))
     if _ARGON2_AVAILABLE:
         try:
             return _ARGON2_HASHER.verify(plaintext, stored_hash)

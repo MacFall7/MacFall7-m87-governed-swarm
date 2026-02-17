@@ -410,8 +410,8 @@ class TestKillswitchLockdown:
                 main_mod.M87_ENV = old_env
                 main_mod.BOOTSTRAP_KEY = old_key
 
-    def test_killswitch_on_prod_custom_key_no_override_warns(self):
-        """Kill-switch in prod with custom key but no override → warns (allows)."""
+    def test_killswitch_on_prod_custom_key_no_override_crashes(self):
+        """Kill-switch in prod with custom key but no override → crashes (fail-closed)."""
         with patch.dict(os.environ, {"M87_DISABLE_PHASE36_GOVERNANCE": "1"}, clear=False):
             import app.main as main_mod
             old_env = main_mod.M87_ENV
@@ -421,7 +421,8 @@ class TestKillswitchLockdown:
             main_mod.BOOTSTRAP_KEY = "real-production-secret-key-12345"
             main_mod.KILLSWITCH_OVERRIDE_PATH = ""
             try:
-                main_mod._enforce_killswitch_lockdown()  # Should warn but not crash
+                with pytest.raises(RuntimeError, match="KILLSWITCH_LOCKDOWN"):
+                    main_mod._enforce_killswitch_lockdown()
             finally:
                 main_mod.M87_ENV = old_env
                 main_mod.BOOTSTRAP_KEY = old_key
