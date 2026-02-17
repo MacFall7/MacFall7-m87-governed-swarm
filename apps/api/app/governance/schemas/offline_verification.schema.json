@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://m87.studio/schemas/offline_verification.schema.json",
+  "title": "M87 Offline Verification Report",
+  "description": "Binary PASS/FAIL bundle verification report.",
+  "type": "object",
+  "required": [
+    "report_version", "overall", "bundle_file", "bundle_hash",
+    "timestamp_utc", "verifier_version", "checks", "known_limitations"
+  ],
+  "properties": {
+    "report_version": { "type": "string", "const": "1.0.0" },
+    "overall": { "type": "string", "enum": ["PASS", "FAIL"] },
+    "bundle_file": { "type": "string" },
+    "bundle_hash": { "type": "string" },
+    "timestamp_utc": { "type": "string", "format": "date-time" },
+    "verifier_version": { "type": "string" },
+    "keyring_fingerprint": { "type": ["string", "null"] },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["check_id", "name", "status"],
+        "properties": {
+          "check_id": {
+            "type": "string",
+            "enum": [
+              "SIG_VALID", "BUNDLE_HASH_MATCH", "SNAPSHOT_PRESENT",
+              "ARTIFACTS_COMPLETE", "RECEIPTS_CHAIN_VALID",
+              "RECEIPTS_MONOTONIC", "RECEIPTS_NO_GAPS",
+              "BUDGET_COMPLIANCE", "CONTRACT_COMPLETE", "NO_UNTRUSTED_EXEC"
+            ]
+          },
+          "name": { "type": "string" },
+          "status": { "type": "string", "enum": ["PASS", "FAIL", "SKIPPED"] },
+          "detail": { "type": "string" },
+          "expected": { "type": ["string", "null"] },
+          "actual": { "type": ["string", "null"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "known_limitations": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "duration_ms": { "type": ["number", "null"] }
+  },
+  "additionalProperties": false
+}

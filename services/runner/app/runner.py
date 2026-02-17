@@ -859,6 +859,8 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
             deh_evidence=deh_evidence,
         )
 
+    exec_start = time.monotonic()
+
     if tool == "echo":
         result = tool_echo(inputs.get("message", ""), timeout_seconds)
     elif tool == "pytest":
@@ -866,6 +868,21 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
     else:
         # Should never happen due to manifest validation
         raise RuntimeError(f"Unhandled tool: {tool}")
+
+    exec_elapsed_ms = (time.monotonic() - exec_start) * 1000
+
+    # Per-Call Receipt: record execution timing + result hash (observation-only, fail-safe)
+    try:
+        result_bytes = json.dumps(result, sort_keys=True, default=str).encode("utf-8")
+        result["call_receipt_execution"] = {
+            "result_hash": hashlib.sha256(result_bytes).hexdigest(),
+            "result_size_bytes": len(result_bytes),
+            "execution_ms": round(exec_elapsed_ms, 2),
+            "exit_code": result.get("exit_code"),
+            "truncated": False,
+        }
+    except Exception as e:
+        print(f"  ⚠ Call receipt recording failed: {e}", flush=True)
 
     # V1 Governance: Artifact-backed completion enforcement (runner-side)
     # Runner must not report "completed" without artifacts

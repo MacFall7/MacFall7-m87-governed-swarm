@@ -70,6 +70,14 @@ from .governance.quarantine import (
 )
 from .governance.rate_limiter import KeyRateLimiter, RateLimitResult
 from .governance.effects import EFFECT_SCHEMA_VERSION
+from .governance.call_receipt import (
+    ReceiptEmitter, ProposalRecord, DecisionRecord, ExecutionRecord,
+    EffectClass, DecisionOutcome, PostureLevel, ReversibilityClass,
+    classify_effects, map_decision_outcome, map_posture_level,
+)
+
+import logging as _logging
+_receipt_logger = _logging.getLogger("m87.receipts")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -975,6 +983,97 @@ def check_agent_risk(agent: str, risk_score: Optional[float]) -> tuple[bool, flo
     return risk_score <= max_risk, max_risk
 
 
+# ---- Per-Call Receipt helpers (additive, fail-safe)
+
+def _build_proposal_record(proposal: Proposal) -> ProposalRecord:
+    """Build a ProposalRecord from an M87 Proposal. Fail-safe: raises on error."""
+    proposal_json = proposal.model_dump_json()
+    proposal_hash = hashlib.sha256(proposal_json.encode()).hexdigest()
+    args_json = json.dumps(proposal.artifacts or [], sort_keys=True)
+    args_hash = hashlib.sha256(args_json.encode()).hexdigest()
+
+    resource_paths = []
+    if proposal.artifacts:
+        for art in proposal.artifacts:
+            for key in ("path", "source", "destination", "target"):
+                if art.get(key):
+                    resource_paths.append(art[key])
+
+    rev_class = None
+    if proposal.reversibility_class:
+        try:
+            rev_class = ReversibilityClass(proposal.reversibility_class)
+        except ValueError:
+            pass
+
+    return ProposalRecord(
+        proposal_hash=proposal_hash,
+        tool="echo",  # default tool for governance proposals
+        operation=proposal.summary[:128] if proposal.summary else None,
+        args_hash=args_hash,
+        args_redacted=False,
+        resource_paths=resource_paths,
+        effect_class=classify_effects(list(proposal.effects)),
+        reversibility_class=rev_class,
+    )
+
+
+def _build_decision_record(
+    decision_str: str,
+    reasons: list,
+    risk_score: Optional[float] = None,
+) -> DecisionRecord:
+    """Build a DecisionRecord from governance decision. Fail-safe: raises on error."""
+    tier_value = quarantine_manager.get_state().current_tier.value
+    return DecisionRecord(
+        outcome=map_decision_outcome(decision_str),
+        posture_at_decision=map_posture_level(tier_value),
+        risk_delta=risk_score,
+        cumulative_risk=risk_score,
+        reason="; ".join(reasons) if reasons else None,
+        policy_path="governance_gate",
+    )
+
+
+def _emit_receipt_for_decision(
+    proposal: Proposal,
+    decision_str: str,
+    reasons: list,
+) -> Optional[object]:
+    """
+    Emit a per-call receipt for a governance decision.
+
+    Returns the CallReceipt or None on failure.
+    MUST NOT block the governance pipeline.
+    """
+    try:
+        emitter = ReceiptEmitter(session_id=proposal.proposal_id)
+        proposal_record = _build_proposal_record(proposal)
+        decision_record = _build_decision_record(
+            decision_str, reasons, proposal.risk_score,
+        )
+        receipt = emitter.emit_decision(proposal_record, decision_record)
+
+        if decision_str != "ALLOW":
+            emitter.finalize_denied(receipt)
+        else:
+            receipt.finalize()
+
+        # Emit receipt to telemetry stream
+        emit("call_receipt.emitted", {
+            "proposal_id": proposal.proposal_id,
+            "sequence_number": receipt.sequence_number,
+            "decision": decision_str,
+            "receipt_hash": receipt.receipt_hash,
+            "effect_class": proposal_record.effect_class.value,
+        })
+
+        return receipt
+    except Exception as e:
+        _receipt_logger.warning(f"Receipt emission failed: {e}")
+        return None
+
+
 # ---- V1 Governance: Shadow Eval endpoints
 
 @app.post("/v1/shadow-eval/trigger")
@@ -1612,6 +1711,9 @@ def govern_proposal(
         "agent": agent,
         "principal_id": auth.principal_id,
     })
+
+    # Per-Call Receipt: ALLOW path (observation-only, fail-safe)
+    _emit_receipt_for_decision(proposal, "ALLOW", reasons)
 
     job_id = enqueue_job(
         proposal_id=proposal.proposal_id,
