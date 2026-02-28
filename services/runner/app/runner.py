@@ -780,6 +780,16 @@ def tool_file_write(
 
     if mode == "preview":
         preview_path = resolved + ".preview"
+        
+        # Re-validate preview path to ensure it's still within sandbox
+        canonical_root = os.path.realpath(sandbox_root)
+        if not (preview_path.startswith(canonical_root + os.sep) or preview_path == canonical_root):
+            return {
+                "error": "sandbox_containment",
+                "detail": f"SANDBOX_ESCAPE: Preview path '{preview_path}' is outside sandbox '{canonical_root}'",
+                "exit_code": -1,
+            }
+        
         os.makedirs(os.path.dirname(preview_path), exist_ok=True)
         with open(preview_path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -798,36 +808,43 @@ def tool_file_write(
             },
         }
 
-    # mode == "commit"
-    os.makedirs(os.path.dirname(resolved), exist_ok=True)
-    with open(resolved, "w", encoding="utf-8") as f:
-        f.write(content)
+    if mode == "commit":
+        os.makedirs(os.path.dirname(resolved), exist_ok=True)
+        with open(resolved, "w", encoding="utf-8") as f:
+            f.write(content)
 
-    # Verify: re-read and compare hash (artifact-backed completion)
-    with open(resolved, "rb") as f:
-        verify_hash = hashlib.sha256(f.read()).hexdigest()
+        # Verify: re-read and compare hash (artifact-backed completion)
+        with open(resolved, "rb") as f:
+            verify_hash = hashlib.sha256(f.read()).hexdigest()
 
-    if verify_hash != content_hash:
+        if verify_hash != content_hash:
+            return {
+                "error": "content_hash_mismatch",
+                "detail": f"Written file hash {verify_hash[:16]}... != expected {content_hash[:16]}...",
+                "exit_code": -1,
+            }
+
         return {
-            "error": "content_hash_mismatch",
-            "detail": f"Written file hash {verify_hash[:16]}... != expected {content_hash[:16]}...",
-            "exit_code": -1,
+            "exit_code": 0,
+            "mode": "commit",
+            "path": path,
+            "resolved_path": resolved,
+            "content_hash": content_hash,
+            "verify_hash": verify_hash,
+            "bytes_written": len(content.encode("utf-8")),
+            "completion_artifacts": {
+                "files": [{"path": resolved, "sha256": verify_hash}],
+                "diffs": [],
+                "logs": [],
+                "receipts": [receipt],
+            },
         }
 
+    # Unknown mode - fail closed
     return {
-        "exit_code": 0,
-        "mode": "commit",
-        "path": path,
-        "resolved_path": resolved,
-        "content_hash": content_hash,
-        "verify_hash": verify_hash,
-        "bytes_written": len(content.encode("utf-8")),
-        "completion_artifacts": {
-            "files": [{"path": resolved, "sha256": verify_hash}],
-            "diffs": [],
-            "logs": [],
-            "receipts": [receipt],
-        },
+        "error": "invalid_mode",
+        "detail": f"Unrecognized mode '{mode}'. Valid modes: draft, preview, commit",
+        "exit_code": -1,
     }
 
 
@@ -1043,7 +1060,7 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
         result = tool_file_write(
             path=inputs.get("path", ""),
             content=inputs.get("content", ""),
-            mode=inputs.get("mode", exec_mode),
+            mode=exec_mode,
         )
     else:
         # Should never happen due to manifest validation
