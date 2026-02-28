@@ -65,6 +65,7 @@ echo ""
 echo "Submitting DEPLOY proposal (should require approval)..."
 RESPONSE=$(curl -s -X POST "$API/v1/govern/proposal" \
   -H "content-type: application/json" \
+  -H "X-M87-Key: $M87_API_KEY" \
   -d '{
     "proposal_id":"p-deploy-1",
     "intent_id":"i-1",
@@ -309,6 +310,7 @@ echo "Submitting proposal for hash-pinning test..."
 HASH_PROP_ID="p-hash-test-$(date +%s)"
 RESPONSE=$(curl -s -X POST "$API/v1/govern/proposal" \
   -H "content-type: application/json" \
+  -H "X-M87-Key: $M87_API_KEY" \
   -d "{
     \"proposal_id\":\"$HASH_PROP_ID\",
     \"intent_id\":\"i-hash-test\",
