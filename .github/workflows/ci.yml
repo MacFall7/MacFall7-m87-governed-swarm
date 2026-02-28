@@ -29,12 +29,12 @@ jobs:
       - name: Run unit tests
         run: |
           cd apps/api
-          pytest tests/ --tb=short -v
+          PYTHONPATH=$PYTHONPATH:../../services/runner/app pytest tests/ --tb=short -v
 
       - name: Run tests with coverage
         run: |
           cd apps/api
-          pytest tests/ --cov=app --cov-report=xml --cov-report=term-missing
+          PYTHONPATH=$PYTHONPATH:../../services/runner/app pytest tests/ --cov=app --cov-report=xml --cov-report=term-missing
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
@@ -131,6 +131,8 @@ jobs:
           npm ci
 
       - name: Run audit.sh
+        env:
+          PYTHONPATH: ${{ github.workspace }}/services/runner/app
         run: ./scripts/audit.sh
 
       - name: Upload evidence artifacts
