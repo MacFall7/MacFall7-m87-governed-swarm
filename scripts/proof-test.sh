@@ -314,15 +314,15 @@ RESPONSE=$(curl -s -X POST "$API/v1/govern/proposal" \
   -d "{
     \"proposal_id\":\"$HASH_PROP_ID\",
     \"intent_id\":\"i-hash-test\",
-    \"agent\":\"Jordan\",
+    \"agent\":\"Casey\",
     \"summary\":\"Test manifest hash pinning\",
-    \"effects\":[\"SEND_NOTIFICATION\"],
+    \"effects\":[\"READ_REPO\"],
     \"truth_account\":{\"observations\":[\"test\"],\"claims\":[]}
   }")
 
 DECISION=$(echo "$RESPONSE" | jq -r '.decision')
 if [ "$DECISION" != "ALLOW" ]; then
-    echo -e "${RED}✗ Expected ALLOW for SEND_NOTIFICATION, got: $DECISION${NC}"
+    echo -e "${RED}✗ Expected ALLOW for READ_REPO, got: $DECISION${NC}"
     exit 1
 fi
 
