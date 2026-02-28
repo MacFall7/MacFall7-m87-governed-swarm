@@ -29,6 +29,22 @@
         }
       },
       "timeout_seconds": 300
+    },
+
+    "file_write": {
+      "description": "Write content to a file inside the runner sandbox.",
+      "effects": ["WRITE_PATCH"],
+      "requires_human": false,
+      "supports_modes": ["commit", "draft", "preview"],
+      "inputs": {
+        "required": ["path", "content"],
+        "optional": ["mode"],
+        "limits": {
+          "path_max_len": 512,
+          "content_max_len": 65536
+        }
+      },
+      "timeout_seconds": 30
     }
   }
 }

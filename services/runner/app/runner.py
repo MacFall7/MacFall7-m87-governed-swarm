@@ -30,6 +30,9 @@ MANIFEST_LOCK_PATH = os.getenv("M87_MANIFEST_LOCK_PATH", "manifest.lock.json")
 # Phase 5 Step 3: Result payload cap
 MAX_REPORT_BYTES = int(os.getenv("M87_MAX_RUNNER_RESULT_BYTES", "65536"))
 
+# Sandbox root for file_write tool (defense-in-depth containment)
+SANDBOX_ROOT = os.getenv("M87_SANDBOX_ROOT", "/tmp/m87-sandbox")
+
 # Layer 1: Effect schema version — must match API's EFFECT_SCHEMA_VERSION.
 # Runner rejects jobs with mismatched versions to prevent taxonomy drift.
 RUNNER_EFFECT_SCHEMA_VERSION = "1.0.0"
@@ -184,6 +187,7 @@ def resolve_autonomy_budget(job: Dict[str, Any]) -> Dict[str, Any]:
 TOOL_WRITE_SCOPE_REQUIREMENTS = {
     "echo": "none",           # Pure output, no writes
     "pytest": "sandbox",      # May write temp files/logs
+    "file_write": "sandbox",  # Writes to sandbox only
     # Future tools:
     # "git_push": "prod",
     # "db_migrate": "prod",
@@ -536,6 +540,27 @@ def validate_job_against_manifest(job: Dict[str, Any], manifest: Dict[str, Any])
         if len(args) > max_len:
             return f"pytest.args exceeds max length ({max_len})"
 
+    if tool == "file_write":
+        path = inputs.get("path", "")
+        if not isinstance(path, str):
+            return "file_write.path must be a string"
+        path_max = int(limits.get("path_max_len", 512))
+        if len(path) > path_max:
+            return f"file_write.path exceeds max length ({path_max})"
+
+        content = inputs.get("content", "")
+        if not isinstance(content, str):
+            return "file_write.content must be a string"
+        content_max = int(limits.get("content_max_len", 65536))
+        if len(content) > content_max:
+            return f"file_write.content exceeds max length ({content_max})"
+
+        mode = inputs.get("mode")
+        if mode is not None:
+            valid_modes = tool_spec.get("supports_modes", ["commit", "draft", "preview"])
+            if mode not in valid_modes:
+                return f"file_write.mode '{mode}' not in supported modes: {valid_modes}"
+
     return None
 
 
@@ -573,6 +598,46 @@ def _scrubbed_env() -> Dict[str, str]:
             continue
         out[k] = v
     return out
+
+
+# ---- Sandbox path resolution (defense-in-depth for file_write)
+
+def _resolve_sandbox_path(relative_path: str, sandbox_root: str = None) -> str:
+    """
+    Resolve a relative path within the sandbox, with containment enforcement.
+
+    Defense-in-depth: independent of governance API path checks.
+    Rejects:
+    - Null byte injection (\\x00 in path)
+    - Traversal escape (resolved path outside sandbox)
+    - Absolute paths (must be relative to sandbox)
+
+    Returns absolute path within sandbox.
+    Raises ValueError on containment violation.
+    """
+    if sandbox_root is None:
+        sandbox_root = SANDBOX_ROOT
+
+    # Null byte injection check
+    if "\x00" in relative_path:
+        raise ValueError(f"SANDBOX_NULL_BYTE: Null byte detected in path: {relative_path!r}")
+
+    # Reject absolute paths — all writes must be relative to sandbox
+    if os.path.isabs(relative_path):
+        raise ValueError(f"SANDBOX_ABSOLUTE_PATH: Absolute paths not allowed: {relative_path}")
+
+    # Resolve canonical path
+    canonical_root = os.path.realpath(sandbox_root)
+    candidate = os.path.realpath(os.path.join(canonical_root, relative_path))
+
+    # Containment check: resolved path must be under sandbox root
+    if not (candidate.startswith(canonical_root + os.sep) or candidate == canonical_root):
+        raise ValueError(
+            f"SANDBOX_ESCAPE: Path '{relative_path}' resolves to '{candidate}' "
+            f"which is outside sandbox '{canonical_root}'"
+        )
+
+    return candidate
 
 
 # ---- Tool implementations (the runner is allowed to be boring)
@@ -656,6 +721,114 @@ def tool_pytest(args: str, timeout_seconds: int) -> Dict[str, Any]:
         }
     except subprocess.TimeoutExpired:
         return {"error": "timeout", "exit_code": -1, "stdout": "", "stderr": ""}
+
+
+def tool_file_write(
+    path: str,
+    content: str,
+    mode: str = "commit",
+    sandbox_root: str = None,
+) -> Dict[str, Any]:
+    """
+    Write content to a file inside the sandbox.
+
+    Three execution modes:
+    - draft: Validate path and content, produce receipt, but write nothing.
+    - preview: Write to {path}.preview for inspection. No production side-effects.
+    - commit: Write file, re-read, and verify content hash matches.
+
+    Defense-in-depth: sandbox containment is enforced here independently
+    of governance API path checks.
+
+    Returns result dict with completion artifacts.
+    """
+    if sandbox_root is None:
+        sandbox_root = SANDBOX_ROOT
+
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    # Resolve and validate path (raises ValueError on escape)
+    try:
+        resolved = _resolve_sandbox_path(path, sandbox_root)
+    except ValueError as e:
+        return {
+            "error": "sandbox_containment",
+            "detail": str(e),
+            "exit_code": -1,
+        }
+
+    receipt = _make_receipt(
+        f"file_write:{mode}",
+        proof=f"content_hash={content_hash[:16]},path={path}",
+    )
+
+    if mode == "draft":
+        return {
+            "exit_code": 0,
+            "mode": "draft",
+            "path": path,
+            "resolved_path": resolved,
+            "content_hash": content_hash,
+            "bytes_planned": len(content.encode("utf-8")),
+            "completion_artifacts": {
+                "files": [],
+                "diffs": [],
+                "logs": [],
+                "receipts": [receipt],
+            },
+        }
+
+    if mode == "preview":
+        preview_path = resolved + ".preview"
+        os.makedirs(os.path.dirname(preview_path), exist_ok=True)
+        with open(preview_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return {
+            "exit_code": 0,
+            "mode": "preview",
+            "path": path,
+            "resolved_path": preview_path,
+            "content_hash": content_hash,
+            "bytes_written": len(content.encode("utf-8")),
+            "completion_artifacts": {
+                "files": [{"path": preview_path, "sha256": content_hash}],
+                "diffs": [],
+                "logs": [],
+                "receipts": [receipt],
+            },
+        }
+
+    # mode == "commit"
+    os.makedirs(os.path.dirname(resolved), exist_ok=True)
+    with open(resolved, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    # Verify: re-read and compare hash (artifact-backed completion)
+    with open(resolved, "rb") as f:
+        verify_hash = hashlib.sha256(f.read()).hexdigest()
+
+    if verify_hash != content_hash:
+        return {
+            "error": "content_hash_mismatch",
+            "detail": f"Written file hash {verify_hash[:16]}... != expected {content_hash[:16]}...",
+            "exit_code": -1,
+        }
+
+    return {
+        "exit_code": 0,
+        "mode": "commit",
+        "path": path,
+        "resolved_path": resolved,
+        "content_hash": content_hash,
+        "verify_hash": verify_hash,
+        "bytes_written": len(content.encode("utf-8")),
+        "completion_artifacts": {
+            "files": [{"path": resolved, "sha256": verify_hash}],
+            "diffs": [],
+            "logs": [],
+            "receipts": [receipt],
+        },
+    }
 
 
 def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]:
@@ -865,6 +1038,13 @@ def execute_job(job: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]
         result = tool_echo(inputs.get("message", ""), timeout_seconds)
     elif tool == "pytest":
         result = tool_pytest(inputs.get("args", ""), timeout_seconds)
+    elif tool == "file_write":
+        exec_mode = job.get("execution_mode", "commit").lower()
+        result = tool_file_write(
+            path=inputs.get("path", ""),
+            content=inputs.get("content", ""),
+            mode=inputs.get("mode", exec_mode),
+        )
     else:
         # Should never happen due to manifest validation
         raise RuntimeError(f"Unhandled tool: {tool}")
