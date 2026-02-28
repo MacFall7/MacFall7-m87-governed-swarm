@@ -69,7 +69,7 @@ RESPONSE=$(curl -s -X POST "$API/v1/govern/proposal" \
   -d '{
     "proposal_id":"p-deploy-1",
     "intent_id":"i-1",
-    "agent":"Planner",
+    "agent":"Human",
     "summary":"Deploy demo",
     "effects":["RUN_TESTS","DEPLOY"],
     "truth_account":{"observations":["test"],"claims":[]}
@@ -314,7 +314,7 @@ RESPONSE=$(curl -s -X POST "$API/v1/govern/proposal" \
   -d "{
     \"proposal_id\":\"$HASH_PROP_ID\",
     \"intent_id\":\"i-hash-test\",
-    \"agent\":\"Tester\",
+    \"agent\":\"Jordan\",
     \"summary\":\"Test manifest hash pinning\",
     \"effects\":[\"SEND_NOTIFICATION\"],
     \"truth_account\":{\"observations\":[\"test\"],\"claims\":[]}
