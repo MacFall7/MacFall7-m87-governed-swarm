@@ -2,6 +2,8 @@
   "name": "@m87/ui",
   "version": "1.0.0",
   "description": "M87 Governance Observability UI",
+  "author": "M87 Studio LLC",
+  "license": "BSL-1.1",
   "type": "module",
   "scripts": {
     "start": "node server.js",
