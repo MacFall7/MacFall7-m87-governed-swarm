@@ -1,7 +1,7 @@
 {
   "manifest_version": "1.1",
   "manifest_path": "services/runner/app/tool_manifest.json",
-  "sha256": "8895a92f297cd4b5bc5abc91ec6c67ecfb5bd3779df6814e19decc94f5bbe628",
-  "generated_at": "2026-02-06T00:00:00Z",
-  "source_commit": "9dc4889"
+  "sha256": "bdf07df5917d69a04096714176311733697359efa5e8f2db752749f9c5f19dbe",
+  "generated_at": "2026-02-28T00:00:00Z",
+  "source_commit": "8ef33a1"
 }

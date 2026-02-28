@@ -261,7 +261,7 @@ JOB_STREAM = "m87:jobs"
 
 # Runner tool allowlist — MUST match tool_manifest.json exactly.
 # Adding a tool here without a manifest entry is a Layer 1 violation.
-ALLOWED_TOOLS = {"echo", "pytest"}
+ALLOWED_TOOLS = {"echo", "pytest", "file_write"}
 
 
 # ---- V1.3: Agent Profiles (effect scopes + risk thresholds)
