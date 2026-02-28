@@ -62,6 +62,7 @@ jobs:
 
       - name: Start services
         run: |
+          export $(grep -v '^#' .env | grep -v '^$' | xargs)
           docker compose --env-file .env -f infra/docker-compose.yml up -d --build
           sleep 10
 

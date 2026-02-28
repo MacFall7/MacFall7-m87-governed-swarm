@@ -69,7 +69,7 @@ RESPONSE=$(curl -s -X POST "$API/v1/govern/proposal" \
   -d '{
     "proposal_id":"p-deploy-1",
     "intent_id":"i-1",
-    "agent":"Planner",
+    "agent":"Human",
     "summary":"Deploy demo",
     "effects":["RUN_TESTS","DEPLOY"],
     "truth_account":{"observations":["test"],"claims":[]}
@@ -314,15 +314,15 @@ RESPONSE=$(curl -s -X POST "$API/v1/govern/proposal" \
   -d "{
     \"proposal_id\":\"$HASH_PROP_ID\",
     \"intent_id\":\"i-hash-test\",
-    \"agent\":\"Tester\",
+    \"agent\":\"Casey\",
     \"summary\":\"Test manifest hash pinning\",
-    \"effects\":[\"SEND_NOTIFICATION\"],
+    \"effects\":[\"READ_REPO\"],
     \"truth_account\":{\"observations\":[\"test\"],\"claims\":[]}
   }")
 
 DECISION=$(echo "$RESPONSE" | jq -r '.decision')
 if [ "$DECISION" != "ALLOW" ]; then
-    echo -e "${RED}✗ Expected ALLOW for SEND_NOTIFICATION, got: $DECISION${NC}"
+    echo -e "${RED}✗ Expected ALLOW for READ_REPO, got: $DECISION${NC}"
     exit 1
 fi
 
@@ -401,7 +401,7 @@ fi
 echo ""
 
 echo "Testing redaction (secret patterns stripped)..."
-SECRET_PAYLOAD="{\"job_id\":\"job-redact-test-$(date +%s)\",\"proposal_id\":\"p-redact-test\",\"status\":\"failed\",\"output\":{\"stdout\":\"-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\nAPI_KEY=supersecret123\"},\"manifest_hash\":\"$MANIFEST_HASH\"}"
+SECRET_PAYLOAD="{\"job_id\":\"$JOB_ID\",\"proposal_id\":\"$HASH_PROP_ID\",\"status\":\"failed\",\"output\":{\"stdout\":\"-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\nAPI_KEY=supersecret123\"},\"manifest_hash\":\"$MANIFEST_HASH\"}"
 
 REDACT_RESPONSE=$(curl -s -X POST "$API/v1/runner/result" \
   -H "content-type: application/json" \
