@@ -55,11 +55,9 @@ jobs:
 
       - name: Create .env file
         run: |
-          cat > .env << 'EOF'
-          M87_API_KEY=m87-ci-test-key
-          M87_ENABLE_TEST_ENDPOINTS=true
-          POSTGRES_PASSWORD=ci-test-password
-          EOF
+          echo "M87_API_KEY=m87-ci-test-key" > .env
+          echo "M87_ENABLE_TEST_ENDPOINTS=true" >> .env
+          echo "POSTGRES_PASSWORD=ci-test-password" >> .env
 
       - name: Start services
         run: |
