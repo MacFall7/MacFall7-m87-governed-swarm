@@ -2059,7 +2059,7 @@ def runner_result(result: RunnerResult, x_m87_key: Optional[str] = Header(None, 
         persist_execution(
             job_id=result.job_id,
             status=effective_status,
-            output=safe_output,
+            output=json.dumps(safe_output) if safe_output else None,
             error=safe_output.get("error") if isinstance(safe_output, dict) else artifact_rejection,
             runner_id=auth.principal_id,
         )

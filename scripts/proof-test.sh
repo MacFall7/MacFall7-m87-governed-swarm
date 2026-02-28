@@ -401,7 +401,7 @@ fi
 echo ""
 
 echo "Testing redaction (secret patterns stripped)..."
-SECRET_PAYLOAD="{\"job_id\":\"job-redact-test-$(date +%s)\",\"proposal_id\":\"p-redact-test\",\"status\":\"failed\",\"output\":{\"stdout\":\"-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\nAPI_KEY=supersecret123\"},\"manifest_hash\":\"$MANIFEST_HASH\"}"
+SECRET_PAYLOAD="{\"job_id\":\"$JOB_ID\",\"proposal_id\":\"$HASH_PROP_ID\",\"status\":\"failed\",\"output\":{\"stdout\":\"-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\nAPI_KEY=supersecret123\"},\"manifest_hash\":\"$MANIFEST_HASH\"}"
 
 REDACT_RESPONSE=$(curl -s -X POST "$API/v1/runner/result" \
   -H "content-type: application/json" \
