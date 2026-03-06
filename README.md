@@ -371,5 +371,3 @@ Claude Code operates as a **compiler** for this system, not a collaborator. It s
 ## License
 
 Business Source License 1.1 — see [LICENSE](LICENSE) for details.
-
-## Session Reference
